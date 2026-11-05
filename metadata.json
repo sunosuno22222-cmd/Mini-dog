@@ -1,0 +1,6 @@
+{
+  "name": "Project Phoenix Reforged — Painel Discord",
+  "description": "Painel de controle e gerenciamento para bot Discord real: servidores, canais, cargos, regras, templates e interações /load e Olho do Inferno.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
