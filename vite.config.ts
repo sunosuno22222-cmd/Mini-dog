@@ -19,15 +19,34 @@ function apiPlugin(): Plugin {
         })
         .catch((err) => console.error('[Bot module load error]:', err));
 
+      // Attach WebSocket /ws/broadcast to Vite HTTP server
+      if (server.httpServer) {
+        server.ssrLoadModule('/src/server/broadcastHub.ts')
+          .then(({ attachBroadcastWebSocketServer }) => {
+            attachBroadcastWebSocketServer(server.httpServer);
+          })
+          .catch((err) => console.error('[BroadcastHub attach error]:', err));
+      }
+
+      // Cleanup Jogo da Call channels & notify SMS if Vite server restarts/closes
+      server.httpServer?.once('close', () => {
+        server.ssrLoadModule('/src/server/callGame.ts')
+          .then(({ cleanupAllCallGamesOnShutdown }) =>
+            cleanupAllCallGamesOnShutdown('Servidor do site encerrado ou reiniciado.')
+          )
+          .catch(() => {});
+      });
+
       const app = express();
       
-      // Raw body capture for Discord Ed25519 webhook signature validation
+      // Raw body capture for Discord Ed25519 webhook signature validation and large audio/video uploads
       app.use(express.json({
+        limit: '60mb',
         verify: (req, _res, buf) => {
           (req as any).rawBody = buf.toString('utf8');
         }
       }));
-      app.use(express.urlencoded({ extended: true }));
+      app.use(express.urlencoded({ limit: '60mb', extended: true }));
 
       // Handle Discord HTTP Interactions
       app.post(['/public/discord/interactions', '/api/public/discord/interactions'], async (req, res) => {
@@ -50,8 +69,32 @@ function apiPlugin(): Plugin {
         }
       });
 
+      // Express error handler (prevents PayloadTooLargeError from bubbling to Vite's Connect handler)
+      app.use((err: any, _req: any, res: any, _next: any) => {
+        const status = err?.status || err?.statusCode || 500;
+        const message =
+          err?.type === 'entity.too.large'
+            ? 'Arquivo muito grande para envio (limite máximo de 60MB no payload).'
+            : err?.message || 'Erro interno no servidor.';
+        if (!res.headersSent) {
+          res.status(status).json({ error: message });
+        }
+      });
+
       // Mount Express on Connect middleware under /api
       server.middlewares.use('/api', app);
+
+      // Also support /auth/callback directly for Discord OAuth2 Redirect URIs
+      const authCallbackApp = express();
+      authCallbackApp.get(['/', '/*'], async (req, res) => {
+        try {
+          const { handleDiscordOAuthCallbackReq } = await server.ssrLoadModule('/src/server/discordOAuth.ts');
+          return await handleDiscordOAuthCallbackReq(req, res);
+        } catch (err) {
+          res.status(500).send((err as Error).message);
+        }
+      });
+      server.middlewares.use('/auth/callback', authCallbackApp);
     },
   };
 }

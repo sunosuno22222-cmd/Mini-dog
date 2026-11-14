@@ -3,21 +3,21 @@
 @layer base {
   :root {
     --radius: 0.75rem;
-    --background: #06070a;
+    --background: #090b11;
     --foreground: #f8fafc;
-    --card: #0d1017;
+    --card: #0f131d;
     --card-foreground: #f8fafc;
-    --primary: #ff1493;
+    --primary: #ec4899;
     --primary-foreground: #ffffff;
-    --secondary: #131722;
+    --secondary: #151b29;
     --secondary-foreground: #e2e8f0;
-    --muted: #111520;
+    --muted: #121723;
     --muted-foreground: #94a3b8;
-    --accent: #00f0ff;
+    --accent: #06b6d4;
     --accent-foreground: #041017;
-    --border: #1f2738;
-    --input: #131722;
-    --ring: #ff1493;
+    --border: rgba(255, 255, 255, 0.08);
+    --input: #131824;
+    --ring: #ec4899;
   }
 
   * {
@@ -33,44 +33,55 @@
     overflow-x: hidden;
     background-color: var(--background);
     color: var(--foreground);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    letter-spacing: 0.005em;
   }
 
-  /* Futuristic Cyberpunk Ambient Background */
+  h1, h2, h3, h4, .font-display {
+    font-family: "Plus Jakarta Sans", "DM Sans", sans-serif;
+    text-wrap: balance;
+  }
+
+  code, pre, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Refined Deep Slate Ambient Backdrop */
   body {
-    background-image: 
-      radial-gradient(circle at 50% 0%, rgba(255, 20, 147, 0.12) 0%, transparent 50%),
-      radial-gradient(circle at 100% 100%, rgba(0, 240, 255, 0.06) 0%, transparent 40%),
-      linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
-    background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -10%, rgba(236, 72, 153, 0.09) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 45% at 100% 100%, rgba(6, 182, 212, 0.05) 0%, transparent 55%);
     background-attachment: fixed;
   }
 }
 
-/* Minimalist futuristic scrollbar that never spills */
+/* Minimalist scrollbar */
 ::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 20, 147, 0.3);
+  background: rgba(148, 163, 184, 0.25);
   border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 20, 147, 0.7);
+  background: rgba(236, 72, 153, 0.55);
 }
 
-/* Cyber Glow Utilities */
+/* Subtle surface elevation helpers */
 .cyber-glow-pink {
-  box-shadow: 0 0 20px -5px rgba(255, 20, 147, 0.35);
+  box-shadow: 0 8px 30px -12px rgba(236, 72, 153, 0.22);
 }
 .cyber-glow-cyan {
-  box-shadow: 0 0 20px -5px rgba(0, 240, 255, 0.3);
+  box-shadow: 0 8px 30px -12px rgba(6, 182, 212, 0.22);
 }
 .cyber-border-glow {
-  border-color: rgba(255, 20, 147, 0.4);
+  border-color: rgba(236, 72, 153, 0.32);
+}
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }

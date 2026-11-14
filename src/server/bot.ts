@@ -26,7 +26,23 @@ import {
   createIpTicketChannel,
   handleIpTicketMessage,
 } from "./tickets";
+import {
+  handlePollVote,
+  handlePollUnvote,
+  buildVotersEphemeralEmbed,
+  getPoll,
+  closePoll,
+  createPollInChannel,
+} from "./polls";
 import { registerModerationListeners } from "./moderation";
+import { handleAiVoicePrefixMessage } from "./aiVoice";
+import {
+  handleCallGameReadyClick,
+  handleCallGameOwnerStartClick,
+  handleCallGameVoiceStateUpdate,
+  handleCallGamePrivateMessage,
+  recoverOrphanedCallGameChannelsOnStartup,
+} from "./callGame";
 
 let botClient: Client | null = null;
 let isStarting = false;
@@ -118,17 +134,44 @@ export async function initDiscordGatewayBot(): Promise<Client | null> {
       } catch (err) {
         console.warn("[Discord Gateway] Erro na sincronização inicial:", err);
       }
+
+      // Auto-close any orphaned Jogo da Call channels left over from a site restart/edit/crash & notify SMS
+      try {
+        await recoverOrphanedCallGameChannelsOnStartup();
+      } catch (err) {
+        console.warn("[Discord Gateway] Erro ao recuperar canais órfãos do Jogo da Call:", err);
+      }
     });
 
     // Register Moderação Avançada listeners (Anti-Spam, Timeout & Anti-Rogue Bot)
     registerModerationListeners(client);
 
-    // Handle messages inside IP lookup ticket channels
+    // Handle Jogo da Call private player answers, IP lookup ticket channels & n! Groq AI Voice replies
     client.on(Events.MessageCreate, async (message) => {
+      try {
+        const handledByGame = await handleCallGamePrivateMessage(message);
+        if (handledByGame) return;
+      } catch (err) {
+        console.error("[MessageCreate CallGame error]:", err);
+      }
       try {
         await handleIpTicketMessage(message);
       } catch (err) {
         console.error("[MessageCreate IP ticket error]:", err);
+      }
+      try {
+        await handleAiVoicePrefixMessage(message);
+      } catch (err) {
+        console.error("[MessageCreate AI Voice error]:", err);
+      }
+    });
+
+    // Handle Jogo da Call voice channel joins
+    client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+      try {
+        await handleCallGameVoiceStateUpdate(oldState, newState);
+      } catch (err) {
+        console.error("[VoiceStateUpdate CallGame error]:", err);
       }
     });
 
@@ -196,6 +239,80 @@ export async function initDiscordGatewayBot(): Promise<Client | null> {
           const chanId = customId.replace("ticket_alert_", "");
           const result = await alertAdministrators(guild, chanId, user);
           await interaction.reply({ content: result.message, ephemeral: true }).catch(() => {});
+          return;
+        }
+
+        // --- SISTEMA DE ENQUETES ---
+        // 1. Votar em uma opção
+        if (customId.startsWith("poll_vote_")) {
+          const lastUnder = customId.lastIndexOf("_");
+          const optIdx = parseInt(customId.slice(lastUnder + 1), 10);
+          const pollId = customId.slice("poll_vote_".length, lastUnder);
+
+          const result = await handlePollVote(pollId, optIdx, user, interaction.message as any);
+          await interaction.reply({
+            content: result.message,
+            ephemeral: true,
+          }).catch(() => {});
+          return;
+        }
+
+        // 2. Retirar o próprio voto
+        if (customId.startsWith("poll_unvote_")) {
+          const pollId = customId.replace("poll_unvote_", "");
+          const result = await handlePollUnvote(pollId, user, interaction.message as any);
+          await interaction.reply({
+            content: result.message,
+            ephemeral: true,
+          }).catch(() => {});
+          return;
+        }
+
+        // 3. Ver Votos (Mensagem Efêmera com avatar dos votantes e suas opções)
+        if (customId.startsWith("poll_view_")) {
+          const pollId = customId.replace("poll_view_", "");
+          const poll = getPoll(pollId);
+          if (!poll) {
+            await interaction.reply({
+              content: "⚠️ Enquete não encontrada no sistema.",
+              ephemeral: true,
+            }).catch(() => {});
+            return;
+          }
+
+          const votersEmbed = buildVotersEphemeralEmbed(poll);
+          await interaction.reply({
+            embeds: [votersEmbed],
+            ephemeral: true,
+          }).catch(() => {});
+          return;
+        }
+
+        // 4. Encerrar Enquete (Apenas moderadores ou quem criou)
+        if (customId.startsWith("poll_close_")) {
+          const pollId = customId.replace("poll_close_", "");
+          const result = await closePoll(
+            pollId,
+            user,
+            interaction.member as GuildMember,
+            interaction.message as any
+          );
+          await interaction.reply({
+            content: result.message,
+            ephemeral: true,
+          }).catch(() => {});
+          return;
+        }
+
+        // Jogo da Call: Botão "Estou Pronto"
+        if (customId.startsWith("callgame_ready:")) {
+          await handleCallGameReadyClick(interaction);
+          return;
+        }
+
+        // Jogo da Call: Botão Exclusivo do Dono "Começar Tudo"
+        if (customId.startsWith("callgame_owner_start:")) {
+          await handleCallGameOwnerStartClick(interaction);
           return;
         }
 
@@ -306,6 +423,9 @@ export async function initDiscordGatewayBot(): Promise<Client | null> {
         const isTapa = cmd === "tapa-na-bunda" || cmd === "tapanabunda";
         const isFalar = cmd === "falar";
         const isOlhoDoDiabo = cmd === "olho-do-diabo" || cmd === "buscar-ip" || cmd === "ip-embed" || cmd === "ip_embed" || cmd === "ip";
+        const isEnquete = cmd === "enquete" || cmd === "poll";
+        const isSpamTest = cmd === "spam";
+        const isBlockTest = cmd === "testar-bloqueio" || cmd === "teste-sistema";
 
         // Avisa sobre comandos desativados
         if (["beijo-triplo", "beijotriplo", "alizar", "alisar", "load", "regras", "enviar-embed", "embed"].includes(cmd)) {
@@ -461,8 +581,82 @@ export async function initDiscordGatewayBot(): Promise<Client | null> {
           return;
         }
 
+        if (isEnquete) {
+          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
+          if (!hasPerm) {
+            await interaction.editReply({
+              content: "🚫 **ACESSO NEGADO!**\nO comando `/enquete` é restrito a **Administradores e Moderadores** do servidor.",
+            });
+            return;
+          }
+
+          const channel = interaction.channel as TextChannel;
+          if (!channel) {
+            await interaction.editReply({ content: "⚠️ Canal inválido para criar a enquete." });
+            return;
+          }
+
+          const pergunta = interaction.options.getString("pergunta", true);
+          const op1 = interaction.options.getString("opcao1", true);
+          const op2 = interaction.options.getString("opcao2", true);
+          const op3 = interaction.options.getString("opcao3", false);
+          const op4 = interaction.options.getString("opcao4", false);
+          const op5 = interaction.options.getString("opcao5", false);
+
+          const rawOptions = [op1, op2, op3, op4, op5].filter(Boolean) as string[];
+
+          try {
+            await createPollInChannel(channel, user, pergunta, rawOptions);
+            await interaction.editReply({
+              content: `📊 **Enquete publicada com sucesso neste canal!**\n> 📋 **Pergunta:** *"${pergunta}"*\n> 🔢 **Opções (${rawOptions.length}):** ${rawOptions.map((o, i) => `[${i + 1}] ${o}`).join(" • ")}`,
+            });
+          } catch (err) {
+            await interaction.editReply({
+              content: `⚠️ Falha ao criar enquete: ${(err as Error).message}`,
+            });
+          }
+          return;
+        }
+
+        if (isSpamTest || isBlockTest) {
+          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
+          if (!hasPerm) {
+            await interaction.editReply({
+              content: "🚫 **ACESSO NEGADO!**\nO comando de teste de bloqueio é restrito a **Administradores e Moderadores** do servidor.",
+            });
+            return;
+          }
+
+          if (!interaction.guildId || !interaction.channelId) {
+            await interaction.editReply({ content: "⚠️ Este comando só pode ser usado dentro de um canal do servidor." });
+            return;
+          }
+
+          const { runSecurityTest } = await import("./testBot");
+          const rawType = isSpamTest
+            ? interaction.options.getString("tipo", false) || "spam"
+            : interaction.options.getString("sistema", false) || "all";
+          const testType = (["spam", "invite", "massping", "raid", "all"].includes(rawType) ? rawType : "spam") as
+            | "spam"
+            | "invite"
+            | "massping"
+            | "raid"
+            | "all";
+          const customText = isSpamTest ? interaction.options.getString("texto", false) || undefined : undefined;
+
+          const result = await runSecurityTest(interaction.guildId, interaction.channelId, testType, customText);
+          const adminTip = result.hasAdminWarning
+            ? "\n\n⚠️ **Aviso:** O 2º Bot de Testes está com permissão **Administrador** neste servidor. Para ele deixar de ver todos os canais e enxergar **APENAS** `#spam-não` durante o castigo, remova o cargo de Administrador dele (ou reconvide pelo link sem Admin no painel)."
+            : "";
+
+          await interaction.editReply({
+            content: `🧪 **Teste de Sistema Iniciado!**\n${result.message}${adminTip}`,
+          });
+          return;
+        }
+
         await interaction.editReply({
-          content: `Comando não reconhecido. Comandos disponíveis: \`/selinho\`, \`/tapa-na-bunda\`, \`/falar\`, \`/olho-do-diabo\`, \`/painel-suporte\`, \`/enviar-embed\`.`,
+          content: `Comando não reconhecido. Comandos oficiais disponíveis: \`/spam\`, \`/testar-bloqueio\`, \`/enquete\`, \`/selinho\`, \`/tapa-na-bunda\`, \`/falar\`, \`/olho-do-diabo\`, \`/painel-suporte\`, \`/painel-ip\`, \`/apagar-tickets\`.`,
         });
       } catch (err) {
         console.error("[Interaction execution error]:", err);

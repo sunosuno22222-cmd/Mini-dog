@@ -18,14 +18,69 @@ import {
 } from "../lib/discord.server";
 import { isBotOnline, initDiscordGatewayBot, getBotClient } from "./bot";
 import {
+  initTestDiscordBot,
+  getTestBotInfo,
+  inspectTestBotTokenOrId,
+  extractBotIdFromToken,
+  savePersistedTestBotConfig,
+  getLastTestBotError,
+  runSecurityTest,
+  SecurityTestType,
+} from "./testBot";
+import {
   joinVoiceCall,
   leaveVoiceCall,
   getVoiceSessionStatus,
   speakInVoiceCall,
   playCustomMediaInVoiceCall,
+  getAllClonedVoices,
+  cloneAndSaveVoice,
+  deleteClonedVoice,
+  sendVoiceAudioMessageToChannel,
+  announceBroadcastInCall,
+  broadcastFrameToCallChat,
 } from "./voice";
+import {
+  startServerScreenBroadcast,
+  navigateServerScreen,
+  interactServerScreen,
+  getServerScreenStatus,
+  stopServerScreenBroadcast,
+} from "./serverScreen";
+import {
+  startCallGame,
+  beginCallGameMatch,
+  stopCallGame,
+  getCallGameStatus,
+} from "./callGame";
+import {
+  buildDiscordOAuthUrl,
+  handleDiscordOAuthCallbackReq,
+  getDiscordOAuthSessionInfo,
+  disconnectDiscordOAuthSession,
+  getGuildVoiceChannelsForBroadcast,
+  setOwnerProvidedDiscordLink,
+  getOAuthSetupMetadata,
+} from "./discordOAuth";
+import {
+  getBroadcastState,
+  updateBroadcastConfig,
+  triggerTestBroadcastScene,
+  stopAndResetBroadcast,
+  BroadcastSceneId,
+} from "./broadcastHub";
 import { applyZigZagChannelStyle, ZigZagStyle } from "./template";
 import { getAllTickets } from "./tickets";
+import {
+  hydrateAiVoiceFromDisk,
+  saveAiVoiceToDisk,
+  getAiVoiceConfig,
+  updateAiVoiceConfig,
+  getAiVoiceLogs,
+  testAiVoiceInChannel,
+} from "./aiVoice";
+
+hydrateAiVoiceFromDisk();
 
 export const apiRouter = Router();
 
@@ -38,7 +93,9 @@ function checkPassword(req: Request): boolean {
 
 // 1. System & Bot Status
 apiRouter.get("/status", (_req: Request, res: Response) => {
+  hydrateAiVoiceFromDisk();
   const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  const testBotInfo = getTestBotInfo();
   const clientSecret = process.env.DISCORD_CLIENT_SECRET?.trim();
   const publicKey = process.env.DISCORD_PUBLIC_KEY?.trim();
   const appId = process.env.DISCORD_APPLICATION_ID?.trim();
@@ -47,11 +104,14 @@ apiRouter.get("/status", (_req: Request, res: Response) => {
 
   res.json({
     botTokenConfigured: Boolean(token && token !== "MY_DISCORD_BOT_TOKEN"),
+    testBotTokenConfigured: testBotInfo.configured,
     clientSecretConfigured: Boolean(clientSecret),
     publicKeyConfigured: Boolean(publicKey),
     appIdConfigured: Boolean(appId),
     groqKeyConfigured: Boolean(groqKey),
     gatewayConnected: isBotOnline(),
+    testBotGatewayConnected: testBotInfo.online,
+    testBot: testBotInfo,
     hasCustomPassword,
     defaultPasswordActive: !hasCustomPassword,
     appUrl: process.env.APP_URL || "",
@@ -60,14 +120,23 @@ apiRouter.get("/status", (_req: Request, res: Response) => {
   });
 });
 
-// 2. Allow updating token and groq key dynamically in runtime
+// 2. Allow updating token, test bot token and groq key dynamically in runtime
 apiRouter.post("/discord/configure", async (req: Request, res: Response) => {
   if (!checkPassword(req)) {
     return res.status(401).json({ error: "Senha do painel incorreta." });
   }
 
-  const { botToken: newToken, clientSecret: newSecret, publicKey: newKey, appId: newAppId, groqApiKey: newGroqKey } = req.body || {};
+  const {
+    botToken: newToken,
+    clientSecret: newSecret,
+    publicKey: newKey,
+    appId: newAppId,
+    groqApiKey: newGroqKey,
+    testBotToken: newTestBotToken,
+    testBotAppId: newTestBotAppId,
+  } = req.body || {};
   let tokenChanged = false;
+  let testTokenChanged = false;
 
   if (typeof newToken === "string" && newToken.trim()) {
     process.env.DISCORD_BOT_TOKEN = newToken.trim();
@@ -84,13 +153,59 @@ apiRouter.post("/discord/configure", async (req: Request, res: Response) => {
   }
   if (typeof newGroqKey === "string" && newGroqKey.trim()) {
     process.env.GROQ_API_KEY = newGroqKey.trim();
+    saveAiVoiceToDisk(newGroqKey.trim());
+  }
+  if (typeof newTestBotToken === "string" && newTestBotToken.trim()) {
+    const cleanTestToken = newTestBotToken.trim();
+    process.env.TEST_BOT_TOKEN = cleanTestToken;
+    testTokenChanged = true;
+    const extracted = extractBotIdFromToken(cleanTestToken);
+    savePersistedTestBotConfig({
+      token: cleanTestToken,
+      ...(extracted ? { botId: extracted, applicationId: extracted } : {}),
+    });
+  }
+  if (typeof newTestBotAppId === "string" && newTestBotAppId.trim()) {
+    const cleanAppId = newTestBotAppId.trim();
+    process.env.TEST_BOT_APPLICATION_ID = cleanAppId;
+    savePersistedTestBotConfig({
+      applicationId: cleanAppId,
+      ...(/^\d{17,22}$/.test(cleanAppId) ? { botId: cleanAppId } : {}),
+    });
+  }
+
+  // Ensure the Test Bot ID is immediately whitelisted and unbanned before connecting/joining
+  const knownTestBotId =
+    process.env.TEST_BOT_ID?.trim() ||
+    extractBotIdFromToken(process.env.TEST_BOT_TOKEN) ||
+    process.env.TEST_BOT_APPLICATION_ID?.trim();
+  if (knownTestBotId && /^\d{17,22}$/.test(knownTestBotId)) {
+    const { whitelistBotId, unbanAndAuthorizeBot } = await import("./moderation");
+    whitelistBotId(knownTestBotId);
+    const mainClient = getBotClient();
+    if (mainClient && mainClient.isReady()) {
+      for (const [, g] of mainClient.guilds.cache) {
+        await unbanAndAuthorizeBot(g, knownTestBotId).catch(() => {});
+      }
+    }
   }
 
   if (tokenChanged) {
     initDiscordGatewayBot().catch((e) => console.error("Error reconnecting bot:", e));
   }
+  if (testTokenChanged) {
+    await initTestDiscordBot(true).catch((e) => console.error("Error reconnecting test bot:", e));
+  }
 
-  res.json({ success: true, message: "Configurações atualizadas com sucesso." });
+  const testBotInfo = getTestBotInfo();
+  res.json({
+    success: true,
+    message: testTokenChanged && !testBotInfo.online && testBotInfo.lastError
+      ? `Token salvo, mas o login falhou: ${testBotInfo.lastError}`
+      : "Configurações atualizadas com sucesso.",
+    testBot: testBotInfo,
+    error: testTokenChanged && !testBotInfo.online ? getLastTestBotError() : null,
+  });
 });
 
 // 2.1 Reconnect Gateway Bot
@@ -106,6 +221,127 @@ apiRouter.post("/discord/reconnect-bot", async (req: Request, res: Response) => 
       online: Boolean(client && client.isReady()),
       user: client?.user?.tag ?? null,
     });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 2.2 Reconnect 2nd Security Test Bot
+apiRouter.post("/discord/reconnect-test-bot", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  try {
+    const client = await initTestDiscordBot(true);
+    const info = getTestBotInfo();
+    res.json({
+      success: true,
+      online: Boolean(client && client.isReady()),
+      user: client?.user?.tag ?? null,
+      error: !info.online ? getLastTestBotError() : null,
+      testBot: info,
+    });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 2.2.1 Inspect 2nd Bot Token or ID to instantly return ID + Invite Link (and pre-authorize/unban it)
+apiRouter.post("/discord/test-bot/inspect", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const input = String(req.body?.tokenOrId || process.env.TEST_BOT_TOKEN || process.env.TEST_BOT_APPLICATION_ID || "").trim();
+  if (!input) {
+    return res.status(400).json({ error: "Informe o Token ou Client ID do 2º Bot." });
+  }
+
+  try {
+    const info = await inspectTestBotTokenOrId(input);
+    const { whitelistBotId, unbanAndAuthorizeBot } = await import("./moderation");
+    whitelistBotId(info.id);
+    process.env.TEST_BOT_ID = info.id;
+
+    let unbanned = false;
+    const mainClient = getBotClient();
+    if (mainClient && mainClient.isReady()) {
+      for (const [, g] of mainClient.guilds.cache) {
+        const result = await unbanAndAuthorizeBot(g, info.id).catch(() => ({ unbanned: false }));
+        if (result.unbanned) unbanned = true;
+      }
+    }
+
+    res.json({ success: true, ...info, authorized: true, unbanned });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+// 2.2.2 Unban & Authorize 2nd Test Bot (and clear any inviter timeout)
+apiRouter.post("/discord/test-bot/authorize", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, botId, inviterUserId } = req.body || {};
+  const targetId = String(botId || process.env.TEST_BOT_ID || extractBotIdFromToken(process.env.TEST_BOT_TOKEN) || "").trim();
+  if (!targetId || !/^\d{17,22}$/.test(targetId)) {
+    return res.status(400).json({ error: "Informe um ID válido do Bot de Spam para liberar." });
+  }
+
+  try {
+    const { whitelistBotId, unbanAndAuthorizeBot } = await import("./moderation");
+    whitelistBotId(targetId);
+    process.env.TEST_BOT_ID = targetId;
+
+    const mainClient = getBotClient();
+    let unbannedCount = 0;
+
+    if (mainClient && mainClient.isReady()) {
+      const targetGuilds = guildId
+        ? [mainClient.guilds.cache.get(guildId)].filter(Boolean)
+        : Array.from(mainClient.guilds.cache.values());
+
+      for (const g of targetGuilds) {
+        if (!g) continue;
+        const r = await unbanAndAuthorizeBot(g, targetId, inviterUserId).catch(() => ({ unbanned: false }));
+        if (r.unbanned) unbannedCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      botId: targetId,
+      unbanned: unbannedCount > 0,
+      message:
+        unbannedCount > 0
+          ? `🔓 Bot ${targetId} desbanido em ${unbannedCount} servidor(es) e liberado na lista branca!`
+          : `✅ Bot ${targetId} liberado na lista branca! Pode convidar para o servidor sem ser banido.`,
+    });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 2.3 Run Live Security Test using the 2nd Test Bot
+apiRouter.post("/discord/test-bot/run", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, channelId, testType, customText } = req.body || {};
+  if (!guildId || !channelId) {
+    return res.status(400).json({ error: "guildId e channelId são obrigatórios para rodar o teste." });
+  }
+
+  const validTypes: SecurityTestType[] = ["spam", "invite", "massping", "raid", "all"];
+  const selectedType: SecurityTestType = validTypes.includes(testType) ? testType : "spam";
+
+  try {
+    const result = await runSecurityTest(guildId, channelId, selectedType, customText);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
   }
@@ -325,6 +561,128 @@ apiRouter.post("/discord/moderation/lockdown", async (req: Request, res: Respons
   }
 });
 
+// Create/Verify Quarentine Channel 'spam? Não!' Endpoint
+apiRouter.post("/discord/moderation/create-quarantine-channel", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId } = req.body || {};
+  if (!guildId) return res.status(400).json({ error: "guildId é obrigatório." });
+
+  try {
+    const { getBotClient } = await import("./bot");
+    const { getOrCreateSpamQuarantineChannel } = await import("./moderation");
+    const client = getBotClient();
+    const guild = client?.guilds.cache.get(guildId);
+    if (!guild) {
+      return res.status(404).json({ error: "Servidor não encontrado no bot ativo." });
+    }
+
+    const channel = await getOrCreateSpamQuarantineChannel(guild);
+    if (!channel) {
+      return res.status(500).json({ error: "Falha ao criar o canal de quarentena." });
+    }
+
+    res.json({
+      success: true,
+      channelId: channel.id,
+      channelName: channel.name,
+      message: "🚫 Canal de quarentena 'spam? Não!' pronto e ativado no servidor!",
+    });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// --- POLLS / ENQUETES ENDPOINTS ---
+apiRouter.post("/discord/polls/list", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  try {
+    const { getAllPolls } = await import("./polls");
+    const { guildId } = req.body || {};
+    const polls = getAllPolls(guildId);
+    res.json({ success: true, polls });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/polls/create", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { channelId, question, options } = req.body || {};
+  if (!channelId || !question || !Array.isArray(options) || options.length < 2) {
+    return res.status(400).json({
+      error: "Parâmetros inválidos: channelId, question e pelo menos 2 opções são obrigatórios.",
+    });
+  }
+
+  try {
+    const { getBotClient } = await import("./bot");
+    const { createPollInChannel } = await import("./polls");
+    const client = getBotClient();
+    if (!client || !client.isReady()) {
+      return res.status(503).json({ error: "O bot do Discord não está conectado no momento." });
+    }
+
+    const channel = client.channels.cache.get(channelId);
+    if (!channel || !channel.isTextBased() || !("send" in channel)) {
+      return res.status(404).json({ error: "Canal de texto não encontrado ou inacessível." });
+    }
+
+    const poll = await createPollInChannel(
+      channel as any,
+      client.user!,
+      question,
+      options
+    );
+
+    res.json({ success: true, poll, message: "Enquete publicada com sucesso no Discord!" });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/polls/close", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { pollId } = req.body || {};
+  if (!pollId) return res.status(400).json({ error: "pollId é obrigatório." });
+
+  try {
+    const { getBotClient } = await import("./bot");
+    const { getPoll, closePoll } = await import("./polls");
+    const poll = getPoll(pollId);
+    if (!poll) {
+      return res.status(404).json({ error: "Enquete não encontrada." });
+    }
+
+    const client = getBotClient();
+    let messageObj: any = null;
+    if (client && poll.channelId && poll.messageId) {
+      try {
+        const channel = client.channels.cache.get(poll.channelId);
+        if (channel && channel.isTextBased() && "messages" in channel) {
+          messageObj = await (channel as any).messages.fetch(poll.messageId).catch(() => null);
+        }
+      } catch {}
+    }
+
+    const result = await closePoll(pollId, client?.user || ({ id: "PANEL_ADMIN" } as any), null, messageObj);
+    res.json({ success: result.success, message: result.message, poll });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
 // 7. Send Message or TTS in Channel/Call
 apiRouter.post("/discord/send-message", async (req: Request, res: Response) => {
   if (!checkPassword(req)) {
@@ -339,6 +697,106 @@ apiRouter.post("/discord/send-message", async (req: Request, res: Response) => {
   try {
     await sendTtsMessage(channelId, content, Boolean(tts));
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.0 Send Channel Message (Text Only OR Audio-Only speaking with Bot Voice)
+apiRouter.post("/discord/send-channel-message", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { channelId, content, asAudio, voice, mcpApiKey, expression } = req.body || {};
+  if (!channelId || !String(content || "").trim()) {
+    return res.status(400).json({ error: "Selecione um canal e escreva a mensagem." });
+  }
+
+  const cleanText = String(content).trim();
+
+  try {
+    if (Boolean(asAudio)) {
+      const result = await sendVoiceAudioMessageToChannel(
+        channelId,
+        cleanText,
+        voice || "lhays_anime",
+        mcpApiKey,
+        expression || "shy"
+      );
+      return res.json({
+        ...result,
+        mode: "audio",
+      });
+    } else {
+      const client = getBotClient();
+      if (client && client.isReady()) {
+        const chan = await client.channels.fetch(channelId).catch(() => null);
+        if (chan && chan.isTextBased() && "send" in chan) {
+          await (chan as any).send({ content: cleanText });
+          return res.json({
+            success: true,
+            mode: "text",
+            channelId,
+          });
+        }
+      }
+      await sendTtsMessage(channelId, cleanText, false);
+      return res.json({
+        success: true,
+        mode: "text",
+        channelId,
+      });
+    }
+  } catch (error) {
+    console.error("[Send Channel Message Error]:", error);
+    return res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.0.1 Groq AI Voice (n!) Status, Config & Live Test Endpoints
+apiRouter.post("/discord/ai-voice/status", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+  res.json({
+    success: true,
+    config: getAiVoiceConfig(),
+    logs: getAiVoiceLogs(),
+  });
+});
+
+apiRouter.post("/discord/ai-voice/config", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+  const { config: partialConfig, groqApiKey } = req.body || {};
+  const updated = updateAiVoiceConfig(partialConfig || {}, groqApiKey);
+  res.json({
+    success: true,
+    config: updated,
+  });
+});
+
+apiRouter.post("/discord/ai-voice/test", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+  const { channelId, prompt, forceMood } = req.body || {};
+  if (!channelId) {
+    return res.status(400).json({ error: "Selecione um canal de texto para testar." });
+  }
+
+  try {
+    const moodArg =
+      forceMood === "crazy" || forceMood === "normal" || forceMood === "vip_submissive"
+        ? forceMood
+        : undefined;
+    const result = await testAiVoiceInChannel(channelId, String(prompt || "Oi, tudo bem?"), moodArg);
+    res.json({
+      ...result,
+      logs: getAiVoiceLogs(),
+    });
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
   }
@@ -388,13 +846,470 @@ apiRouter.post("/discord/voice/status", (req: Request, res: Response) => {
     return res.status(401).json({ error: "Senha do painel incorreta." });
   }
 
+  const { guildId, channelId } = req.body || {};
+  if (!guildId) {
+    return res.status(400).json({ error: "guildId é obrigatório." });
+  }
+
+  const status = getVoiceSessionStatus(guildId, channelId);
+  res.json(status);
+});
+
+// 7.3.1 Transmissão de Bot: Entrar na Call e Anunciar Transmissão
+apiRouter.post("/discord/broadcast/start", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, channelId, mode, siteUrl, fallbackTextChannelId } = req.body || {};
+  if (!guildId || !channelId) {
+    return res.status(400).json({ error: "guildId e channelId da call são obrigatórios." });
+  }
+
+  try {
+    const result = await announceBroadcastInCall(
+      guildId,
+      channelId,
+      mode === "camera" || mode === "site" ? mode : "screen",
+      siteUrl,
+      fallbackTextChannelId
+    );
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.3.2 Transmissão de Bot: Enviar/Atualizar Frame Capturado no Chat da Call
+apiRouter.post("/discord/broadcast/send-frame", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, channelId, imageBase64, caption, editMessageId, fallbackTextChannelId } = req.body || {};
+  if (!guildId || !channelId || !imageBase64) {
+    return res.status(400).json({ error: "guildId, channelId e imageBase64 são obrigatórios." });
+  }
+
+  try {
+    const result = await broadcastFrameToCallChat(
+      guildId,
+      channelId,
+      imageBase64,
+      caption,
+      editMessageId,
+      fallbackTextChannelId
+    );
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.3.3 Transmissão de Bot: Verificar Site/Sistema para Exibição (executado no servidor EUA)
+apiRouter.post("/discord/broadcast/check-site", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const rawUrl = String(req.body?.url || "").trim();
+  if (!rawUrl) {
+    return res.status(400).json({ error: "Informe a URL do site ou sistema." });
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : `https://${rawUrl}`);
+  } catch {
+    return res.status(400).json({ error: "URL inválida." });
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return res.status(400).json({ error: "Apenas URLs http:// ou https:// são permitidas." });
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    return res.status(400).json({ error: "Endereços locais ou privados não são permitidos." });
+  }
+
+  try {
+    const resp = await fetch(parsed.toString(), {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(7000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+      },
+    });
+
+    const xFrame = (resp.headers.get("x-frame-options") || "").toLowerCase();
+    const csp = (resp.headers.get("content-security-policy") || "").toLowerCase();
+    let embeddable = true;
+    let blockReason = "";
+
+    if (xFrame.includes("deny") || xFrame.includes("sameorigin")) {
+      embeddable = false;
+      blockReason = `Cabeçalho X-Frame-Options: ${xFrame}`;
+    } else if (csp.includes("frame-ancestors")) {
+      const match = csp.match(/frame-ancestors\s+([^;]+)/);
+      const directive = match?.[1]?.trim() || "";
+      if (directive === "'none'" || directive === "'self'" || !directive.includes("*")) {
+        embeddable = false;
+        blockReason = "Política CSP frame-ancestors restringe embed externo";
+      }
+    }
+
+    const html = await resp.text().catch(() => "");
+    const titleMatch = html.match(/<title[^>]*>([^<]{1,120})<\/title>/i);
+    const title = titleMatch?.[1]?.replace(/\s+/g, " ").trim() || parsed.hostname;
+
+    res.json({
+      success: true,
+      finalUrl: resp.url || parsed.toString(),
+      status: resp.status,
+      title,
+      embeddable,
+      blockReason,
+      serverLocation: "us-east5 (Estados Unidos)",
+    });
+  } catch (err) {
+    res.json({
+      success: true,
+      finalUrl: parsed.toString(),
+      status: 0,
+      title: parsed.hostname,
+      embeddable: true,
+      blockReason: `Não foi possível pré-verificar cabeçalhos (${(err as Error).message}). Tentando carregar direto.`,
+      serverLocation: "us-east5 (Estados Unidos)",
+    });
+  }
+});
+
+// 7.3.4 Transmissão Persistente no Servidor (Chromium Headless 24h - funciona no celular e se fechar o site!)
+apiRouter.post("/discord/broadcast/server-start", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, channelId, url, fallbackTextChannelId, intervalSeconds } = req.body || {};
+  if (!guildId || !channelId || !url) {
+    return res.status(400).json({ error: "guildId, channelId da call e url do site são obrigatórios." });
+  }
+
+  try {
+    const state = await startServerScreenBroadcast({
+      guildId,
+      voiceChannelId: channelId,
+      url,
+      fallbackTextChannelId,
+      intervalSeconds,
+    });
+    res.json({ success: true, state });
+  } catch (error) {
+    console.error("[ServerScreen Start Error]:", error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/broadcast/server-status", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  try {
+    const refresh = Boolean(req.body?.refresh);
+    const state = await getServerScreenStatus(refresh);
+    res.json({ success: true, state });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/broadcast/server-navigate", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "Informe a URL." });
+
+  try {
+    const state = await navigateServerScreen(url);
+    res.json({ success: true, state });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/broadcast/server-interact", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { type, x, y, deltaY, text } = req.body || {};
+  try {
+    const state = await interactServerScreen({ type, x, y, deltaY, text });
+    res.json({ success: true, state });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/broadcast/server-stop", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  try {
+    const state = await stopServerScreenBroadcast();
+    res.json({ success: true, state });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.3.5 Jogo da Call (Entrada na call + 3s + Chat privado + Botão Começar Jogo + Fila sequencial sem aglomerar)
+apiRouter.post("/discord/call-game/status", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
   const { guildId } = req.body || {};
   if (!guildId) {
     return res.status(400).json({ error: "guildId é obrigatório." });
   }
 
-  const status = getVoiceSessionStatus(guildId);
-  res.json(status);
+  res.json({ success: true, game: getCallGameStatus(guildId) });
+});
+
+apiRouter.post("/discord/call-game/start", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const {
+    guildId,
+    channelId,
+    voice,
+    expression,
+    rulesText,
+    ownerUserId,
+    smsChannelId,
+    questions,
+    questionsPerMatch,
+    roundSeconds,
+    autoScreenBroadcast,
+  } = req.body || {};
+  if (!guildId || !channelId) {
+    return res.status(400).json({ error: "guildId e channelId da call são obrigatórios." });
+  }
+
+  try {
+    const oauth = await getDiscordOAuthSessionInfo(req);
+    if (!oauth.connected || !oauth.user) {
+      return res.status(400).json({
+        error:
+          "Conexão obrigatória: conecte sua conta Discord via OAuth2 antes de iniciar o Jogo da Call.",
+        code: "OAUTH_REQUIRED",
+      });
+    }
+
+    const game = await startCallGame({
+      guildId,
+      voiceChannelId: channelId,
+      voice,
+      expression,
+      rulesText,
+      ownerUserId,
+      smsChannelId,
+      questions: Array.isArray(questions) ? questions : undefined,
+      questionsPerMatch:
+        typeof questionsPerMatch === "number"
+          ? questionsPerMatch
+          : Number(questionsPerMatch) || undefined,
+      roundSeconds: typeof roundSeconds === "number" ? roundSeconds : Number(roundSeconds) || undefined,
+      connectedAccount: {
+        userId: oauth.user.id,
+        username: oauth.user.globalName || oauth.user.username,
+        avatar: oauth.user.avatarUrl,
+      },
+      autoScreenBroadcast: autoScreenBroadcast !== false,
+    });
+    res.json({ success: true, game });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/call-game/begin-match", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId } = req.body || {};
+  if (!guildId) {
+    return res.status(400).json({ error: "guildId é obrigatório." });
+  }
+
+  try {
+    const game = await beginCallGameMatch(guildId);
+    res.json({ success: true, game });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/discord/call-game/stop", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId, deleteChannel, disconnectCall } = req.body || {};
+  if (!guildId) {
+    return res.status(400).json({ error: "guildId é obrigatório." });
+  }
+
+  try {
+    const game = await stopCallGame(
+      guildId,
+      deleteChannel !== false,
+      Boolean(disconnectCall)
+    );
+    res.json({ success: true, game });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.3.6 Discord OAuth2 Oficial para Conta Transmissora (Escopos mínimos: identify guilds)
+apiRouter.get("/auth/discord/url", (req: Request, res: Response) => {
+  try {
+    const originHint = typeof req.query.origin === "string" ? req.query.origin : undefined;
+    const useShortCallback = req.query.callbackMode === "short";
+    const includeBotInvite = req.query.includeBotInvite === "1" || req.query.includeBotInvite === "true";
+    const data = buildDiscordOAuthUrl(originHint, { useShortCallback, includeBotInvite });
+    res.json({ success: true, ...data });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.get(["/auth/discord/callback", "/auth/discord/callback/"], async (req: Request, res: Response) => {
+  await handleDiscordOAuthCallbackReq(req, res);
+});
+
+apiRouter.get("/auth/discord/session", async (req: Request, res: Response) => {
+  try {
+    const info = await getDiscordOAuthSessionInfo(req);
+    res.json({ success: true, ...info });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/auth/discord/disconnect", async (req: Request, res: Response) => {
+  try {
+    await disconnectDiscordOAuthSession(req, res);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.get("/auth/discord/setup", (req: Request, res: Response) => {
+  try {
+    const originHint = typeof req.query.origin === "string" ? req.query.origin : undefined;
+    res.json({ success: true, ...getOAuthSetupMetadata(originHint) });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/auth/discord/custom-link", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+  try {
+    const rawLink = typeof req.body?.link === "string" ? req.body.link : "";
+    const result = setOwnerProvidedDiscordLink(rawLink);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+apiRouter.post("/auth/discord/guild-channels", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { guildId } = req.body || {};
+  if (!guildId) {
+    return res.status(400).json({ error: "guildId é obrigatório." });
+  }
+
+  try {
+    const voiceChannels = await getGuildVoiceChannelsForBroadcast(guildId);
+    res.json({ success: true, voiceChannels });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.3.7 Live Visual Broadcast WebSocket State & Scene Controller
+apiRouter.get("/broadcast/state", (_req: Request, res: Response) => {
+  res.json({ success: true, state: getBroadcastState() });
+});
+
+apiRouter.post("/broadcast/config", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { targetGuildId, targetVoiceChannelId, voiceChannelName, resolution, broadcastPrepared } =
+    req.body || {};
+
+  const state = updateBroadcastConfig({
+    targetGuildId,
+    targetVoiceChannelId,
+    voiceChannelName,
+    resolution,
+    broadcastPrepared,
+  });
+  res.json({ success: true, state });
+});
+
+apiRouter.post("/broadcast/test-scene", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const rawScene = Number(req.body?.scene);
+  if (!Number.isInteger(rawScene) || rawScene < 1 || rawScene > 8) {
+    return res.status(400).json({ error: "Informe uma cena válida entre 1 e 8." });
+  }
+
+  const state = triggerTestBroadcastScene(rawScene as BroadcastSceneId);
+  res.json({ success: true, state });
+});
+
+apiRouter.post("/broadcast/stop", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const state = stopAndResetBroadcast();
+  res.json({ success: true, state });
 });
 
 // 7.4 Speak in Voice Call (TTS Voice Audio Playback)
@@ -403,13 +1318,13 @@ apiRouter.post("/discord/voice/speak", async (req: Request, res: Response) => {
     return res.status(401).json({ error: "Senha do painel incorreta." });
   }
 
-  const { guildId, text, channelId, voice } = req.body || {};
+  const { guildId, text, channelId, voice, mcpApiKey, expression } = req.body || {};
   if (!guildId || !text) {
     return res.status(400).json({ error: "guildId e text são obrigatórios." });
   }
 
   try {
-    const result = await speakInVoiceCall(guildId, text, channelId, voice);
+    const result = await speakInVoiceCall(guildId, text, channelId, voice, mcpApiKey, expression);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
@@ -437,6 +1352,58 @@ apiRouter.post("/discord/voice/upload-play", async (req: Request, res: Response)
     res.json(result);
   } catch (error) {
     console.error("[Upload Play Error]:", error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.5.1 Get Saved Cloned Voices
+apiRouter.post("/discord/voice/cloned-voices", (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+  const voices = getAllClonedVoices();
+  res.json({ success: true, voices });
+});
+
+// 7.5.2 Clone and Save Voice Sample
+apiRouter.post("/discord/voice/clone-voice", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { voiceName, sampleBase64, apiKey } = req.body || {};
+  if (!sampleBase64) {
+    return res.status(400).json({ error: "Áudio de amostra (sampleBase64) é obrigatório." });
+  }
+
+  try {
+    const voice = await cloneAndSaveVoice(
+      voiceName || "Minha Voz Clonada",
+      sampleBase64,
+      apiKey
+    );
+    res.json({ success: true, voice });
+  } catch (error) {
+    console.error("[Clone Voice Error]:", error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// 7.5.3 Delete Cloned Voice
+apiRouter.post("/discord/voice/delete-cloned-voice", async (req: Request, res: Response) => {
+  if (!checkPassword(req)) {
+    return res.status(401).json({ error: "Senha do painel incorreta." });
+  }
+
+  const { id } = req.body || {};
+  if (!id) {
+    return res.status(400).json({ error: "ID da voz é obrigatório." });
+  }
+
+  try {
+    const deleted = await deleteClonedVoice(id);
+    res.json({ success: deleted });
+  } catch (error) {
     res.status(500).json({ error: (error as Error).message });
   }
 });

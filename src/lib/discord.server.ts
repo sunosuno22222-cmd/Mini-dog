@@ -118,6 +118,98 @@ export const SLASH_COMMANDS = [
       },
     ],
   },
+  {
+    name: "enquete",
+    description: "Cria uma enquete interativa com porcentagens em tempo real e lista de votantes (Moderação)",
+    dm_permission: false,
+    default_member_permissions: "8192", // MANAGE_MESSAGES
+    options: [
+      {
+        name: "pergunta",
+        description: "Pergunta ou assunto da enquete",
+        type: 3, // STRING
+        required: true,
+      },
+      {
+        name: "opcao1",
+        description: "1ª Opção de resposta",
+        type: 3, // STRING
+        required: true,
+      },
+      {
+        name: "opcao2",
+        description: "2ª Opção de resposta",
+        type: 3, // STRING
+        required: true,
+      },
+      {
+        name: "opcao3",
+        description: "3ª Opção de resposta (opcional)",
+        type: 3, // STRING
+        required: false,
+      },
+      {
+        name: "opcao4",
+        description: "4ª Opção de resposta (opcional)",
+        type: 3, // STRING
+        required: false,
+      },
+      {
+        name: "opcao5",
+        description: "5ª Opção de resposta (opcional)",
+        type: 3, // STRING
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "spam",
+    description: "Usa o 2º Bot de Testes para disparar spam (10x), tomar castigo de 10s e auto-liberar",
+    dm_permission: false,
+    default_member_permissions: "8192", // MANAGE_MESSAGES
+    options: [
+      {
+        name: "texto",
+        description: "Texto opcional que o 2º bot vai repetir 10x para testar o Anti-Spam",
+        type: 3, // STRING
+        required: false,
+      },
+      {
+        name: "tipo",
+        description: "Qual sistema de bloqueio testar (Padrão: Anti-Spam 10x)",
+        type: 3, // STRING
+        required: false,
+        choices: [
+          { name: "Anti-Spam (10x repetido + Castigo 10s)", value: "spam" },
+          { name: "Anti-Links de Convite (discord.gg + Castigo 10s)", value: "invite" },
+          { name: "Anti-MassPing (@everyone + Castigo 10s)", value: "massping" },
+          { name: "Escudo Anti-Raid / Quarentena (#spam-não 10s)", value: "raid" },
+          { name: "Testar TODOS os bloqueios em sequência", value: "all" },
+        ],
+      },
+    ],
+  },
+  {
+    name: "testar-bloqueio",
+    description: "Testa os sistemas de bloqueio usando o 2º Bot (castigo de 10s e liberação automática)",
+    dm_permission: false,
+    default_member_permissions: "8192", // MANAGE_MESSAGES
+    options: [
+      {
+        name: "sistema",
+        description: "Escolha qual proteção/bloqueio deseja testar ao vivo",
+        type: 3, // STRING
+        required: true,
+        choices: [
+          { name: "Anti-Spam (10 mensagens repetidas)", value: "spam" },
+          { name: "Filtro Anti-Links de Convite (discord.gg)", value: "invite" },
+          { name: "Escudo Anti-MassPing (@everyone)", value: "massping" },
+          { name: "Escudo Anti-Raid & Quarentena (#spam-não)", value: "raid" },
+          { name: "Bateria Completa (Todos os Sistemas)", value: "all" },
+        ],
+      },
+    ],
+  },
 ];
 
 export async function checkTrisalRole(guildId: string, memberRoles: string[]): Promise<boolean> {
