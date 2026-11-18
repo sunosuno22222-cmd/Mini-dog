@@ -19,9 +19,16 @@ interface PersistedTestBotConfig {
 
 const CONFIG_FILE_PATH = path.join(process.cwd(), ".test-bot-config.json");
 
-let testBotClient: Client | null = null;
-let isStartingTestBot = false;
-let lastTestBotError: string | null = null;
+const gTestBot = globalThis as any;
+if (!gTestBot.__testBotState) {
+  gTestBot.__testBotState = {
+    client: null as Client | null,
+    isStarting: false,
+    lastError: null as string | null,
+  };
+}
+const tbState: { client: Client | null; isStarting: boolean; lastError: string | null } =
+  gTestBot.__testBotState;
 
 function readPersistedTestBotConfig(): PersistedTestBotConfig {
   try {
@@ -70,15 +77,15 @@ function hydrateTestBotEnvFromDisk(): void {
 }
 
 export function getTestBotClient(): Client | null {
-  return testBotClient;
+  return tbState.client;
 }
 
 export function isTestBotOnline(): boolean {
-  return Boolean(testBotClient && testBotClient.isReady());
+  return Boolean(tbState.client && tbState.client.isReady());
 }
 
 export function getLastTestBotError(): string | null {
-  return lastTestBotError;
+  return tbState.lastError;
 }
 
 export function extractBotIdFromToken(token?: string | null): string | null {
@@ -105,7 +112,7 @@ export function buildTestBotInviteUrl(appOrBotId?: string | null): string | null
 export function getTestBotUserId(): string | null {
   hydrateTestBotEnvFromDisk();
   return (
-    testBotClient?.user?.id ||
+    tbState.client?.user?.id ||
     process.env.TEST_BOT_ID?.trim() ||
     extractBotIdFromToken(process.env.TEST_BOT_TOKEN) ||
     null
@@ -115,7 +122,7 @@ export function getTestBotUserId(): string | null {
 export function isTestBotUser(userId?: string | null): boolean {
   if (!userId) return false;
   hydrateTestBotEnvFromDisk();
-  const activeId = testBotClient?.user?.id;
+  const activeId = tbState.client?.user?.id;
   const envId = process.env.TEST_BOT_ID?.trim();
   const tokenId = extractBotIdFromToken(process.env.TEST_BOT_TOKEN);
   return (
@@ -127,12 +134,12 @@ export function isTestBotUser(userId?: string | null): boolean {
 
 export function getTestBotInfo() {
   hydrateTestBotEnvFromDisk();
-  const user = testBotClient?.user;
+  const user = tbState.client?.user;
   const extractedId = extractBotIdFromToken(process.env.TEST_BOT_TOKEN);
   const resolvedId = user?.id || process.env.TEST_BOT_ID?.trim() || extractedId || null;
   const appId =
     process.env.TEST_BOT_APPLICATION_ID?.trim() ||
-    testBotClient?.application?.id ||
+    tbState.client?.application?.id ||
     resolvedId ||
     "";
 
@@ -144,9 +151,9 @@ export function getTestBotInfo() {
     username: user?.tag || user?.username || null,
     avatar: user?.displayAvatarURL() || null,
     inviteUrl: buildTestBotInviteUrl(appId),
-    guildsCount: testBotClient?.guilds.cache.size || 0,
-    guildIds: testBotClient ? Array.from(testBotClient.guilds.cache.keys()) : [],
-    lastError: lastTestBotError,
+    guildsCount: tbState.client?.guilds.cache.size || 0,
+    guildIds: tbState.client ? Array.from(tbState.client.guilds.cache.keys()) : [],
+    lastError: tbState.lastError,
   };
 }
 
@@ -204,35 +211,35 @@ export async function initTestDiscordBot(forceReconnect = false): Promise<Client
   hydrateTestBotEnvFromDisk();
   const token = process.env.TEST_BOT_TOKEN?.trim();
   if (!token || token === "MY_SECOND_TEST_BOT_TOKEN") {
-    lastTestBotError = "TEST_BOT_TOKEN não configurado.";
+    tbState.lastError = "TEST_BOT_TOKEN não configurado.";
     console.log("[Test Bot Gateway] TEST_BOT_TOKEN não configurado. 2º Bot de Testes em espera.");
     return null;
   }
 
-  if (!forceReconnect && testBotClient && testBotClient.isReady()) {
-    lastTestBotError = null;
-    return testBotClient;
+  if (!forceReconnect && tbState.client && tbState.client.isReady()) {
+    tbState.lastError = null;
+    return tbState.client;
   }
 
-  if (isStartingTestBot) {
+  if (tbState.isStarting) {
     // Wait up to 8s for an in-progress startup to finish
     for (let i = 0; i < 16; i++) {
       await sleep(500);
-      if (testBotClient && testBotClient.isReady()) return testBotClient;
-      if (!isStartingTestBot) break;
+      if (tbState.client && tbState.client.isReady()) return tbState.client;
+      if (!tbState.isStarting) break;
     }
-    return testBotClient;
+    return tbState.client;
   }
 
-  isStartingTestBot = true;
-  lastTestBotError = null;
+  tbState.isStarting = true;
+  tbState.lastError = null;
 
   try {
-    if (testBotClient) {
+    if (tbState.client) {
       try {
-        await testBotClient.destroy();
+        await tbState.client.destroy();
       } catch {}
-      testBotClient = null;
+      tbState.client = null;
     }
 
     // Use ONLY non-privileged intents so the 2nd Test Bot NEVER fails with DisallowedIntents
@@ -269,36 +276,36 @@ export async function initTestDiscordBot(forceReconnect = false): Promise<Client
 
     client.on("error", (err) => {
       console.error("[Test Bot Gateway Error]:", err);
-      lastTestBotError = err.message;
+      tbState.lastError = err.message;
     });
 
     await client.login(token);
     await readyPromise;
 
-    testBotClient = client;
-    lastTestBotError = null;
+    tbState.client = client;
+    tbState.lastError = null;
     return client;
   } catch (err) {
     const rawMsg = (err as Error).message || String(err);
-    lastTestBotError = rawMsg.includes("disallowed intents")
+    tbState.lastError = rawMsg.includes("disallowed intents")
       ? "Intents privilegiadas bloqueadas no Discord Developer Portal."
       : rawMsg.includes("invalid token") || rawMsg.includes("An invalid token was provided")
       ? "Token do 2º Bot inválido! Copie um token novo em Discord Developer Portal -> Bot -> Reset Token."
       : rawMsg;
-    console.error("[Test Bot Gateway] Falha ao iniciar 2º Bot de Testes:", lastTestBotError);
-    testBotClient = null;
+    console.error("[Test Bot Gateway] Falha ao iniciar 2º Bot de Testes:", tbState.lastError);
+    tbState.client = null;
     return null;
   } finally {
-    isStartingTestBot = false;
+    tbState.isStarting = false;
   }
 }
 
 export async function destroyTestDiscordBot(): Promise<void> {
-  if (testBotClient) {
+  if (tbState.client) {
     try {
-      await testBotClient.destroy();
+      await tbState.client.destroy();
     } catch {}
-    testBotClient = null;
+    tbState.client = null;
   }
 }
 
@@ -358,7 +365,7 @@ export async function runSecurityTest(
   hydrateTestBotEnvFromDisk();
 
   // Auto-connect if token exists but Gateway wasn't ready yet
-  if (!testBotClient || !testBotClient.isReady()) {
+  if (!tbState.client || !tbState.client.isReady()) {
     await initTestDiscordBot();
   }
 
@@ -370,8 +377,8 @@ export async function runSecurityTest(
   }
 
   // Resolve Test Bot user ID via Gateway or REST /users/@me fallback
-  let testBotId = testBotClient?.user?.id || getTestBotUserId();
-  let testBotTag = testBotClient?.user?.tag || "Bot de Testes";
+  let testBotId = tbState.client?.user?.id || getTestBotUserId();
+  let testBotTag = tbState.client?.user?.tag || "Bot de Testes";
 
   if (!testBotId) {
     const meRes = await fetch("https://discord.com/api/v10/users/@me", {
@@ -388,7 +395,7 @@ export async function runSecurityTest(
   if (!testBotId) {
     throw new Error(
       `O 2º Bot de Testes não conseguiu conectar${
-        lastTestBotError ? ` (${lastTestBotError})` : ""
+        tbState.lastError ? ` (${tbState.lastError})` : ""
       }. Verifique o TEST_BOT_TOKEN na aba Moderação Avançada.`
     );
   }
@@ -417,7 +424,7 @@ export async function runSecurityTest(
   const testMemberInGuild = mainGuild
     ? await mainGuild.members.fetch(testBotId).catch(() => null)
     : null;
-  const testGuild = testBotClient?.guilds.cache.get(guildId);
+  const testGuild = tbState.client?.guilds.cache.get(guildId);
 
   if (!testMemberInGuild && !testGuild) {
     const info = getTestBotInfo();
@@ -456,7 +463,7 @@ export async function runSecurityTest(
 
   const executeSingleTest = async (mode: Exclude<SecurityTestType, "all">) => {
     if (mode === "spam") {
-      const spamPhrase = customText?.trim() || "🚨 Teste Anti-Spam do Sistema #Phoenix";
+      const spamPhrase = customText?.trim() || "🚨 Teste Anti-Spam do Sistema #573";
       for (let i = 1; i <= 10; i++) {
         await sendAsTestBot(spamPhrase);
         if (i < 10) await sleep(300);
@@ -537,7 +544,7 @@ export async function runSecurityTest(
                   results.join("\n") +
                   `\n\n🛡️ **Conclusão:** O sistema está funcionando 100% e nenhum banimento foi aplicado ao Bot de Testes!`
                 )
-                .setFooter({ text: "Protocolo de Auto-Teste • Sistema Phoenix" })
+                .setFooter({ text: "Protocolo de Auto-Teste • 5573 Satan" })
                 .setTimestamp(),
             ],
           })

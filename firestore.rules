@@ -1,0 +1,342 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all reads and writes by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn();
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['ownerId', 'email', 'displayName', 'discordUserId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'email', 'displayName', 'discordUserId', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.email is string
+        && data.email.size() <= 254
+        && data.displayName is string
+        && data.displayName.size() <= 120
+        && data.discordUserId is string
+        && data.discordUserId.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBannerRule(rule) {
+      return rule is map
+        && rule.keys().hasAll(['enabled', 'channelId', 'channelName', 'title', 'message', 'hasImage'])
+        && rule.keys().hasOnly(['enabled', 'channelId', 'channelName', 'title', 'message', 'hasImage'])
+        && rule.enabled is bool
+        && rule.channelId is string
+        && rule.channelId.size() <= 40
+        && rule.channelName is string
+        && rule.channelName.size() <= 120
+        && rule.title is string
+        && rule.title.size() <= 60
+        && rule.message is string
+        && rule.message.size() <= 300
+        && rule.hasImage is bool;
+    }
+
+    function isValidGuildConfig(data, userId, guildId) {
+      return data.keys().hasAll(['ownerId', 'guildId', 'guildName', 'discordUserId', 'welcome', 'leave', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'guildId', 'guildName', 'discordUserId', 'welcome', 'leave', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.guildId is string
+        && data.guildId == guildId
+        && data.guildId.size() <= 40
+        && data.guildName is string
+        && data.guildName.size() <= 120
+        && data.discordUserId is string
+        && data.discordUserId.size() <= 40
+        && isValidBannerRule(data.welcome)
+        && isValidBannerRule(data.leave)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidGuildAsset(data, userId, guildId, assetId) {
+      return data.keys().hasAll(['ownerId', 'guildId', 'eventType', 'dataUrl', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'guildId', 'eventType', 'dataUrl', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.guildId is string
+        && data.guildId == guildId
+        && data.guildId.size() <= 40
+        && data.eventType is string
+        && data.eventType == assetId
+        && (assetId == 'welcome' || assetId == 'leave')
+        && data.dataUrl is string
+        && data.dataUrl.size() <= 900000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTikTokIntegration(data, userId, integrationId) {
+      return data.keys().hasAll(['ownerId', 'provider', 'username', 'displayName', 'encryptedBackup', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'provider', 'username', 'displayName', 'encryptedBackup', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && integrationId == 'tiktok'
+        && data.provider is string
+        && data.provider.size() <= 32
+        && data.username is string
+        && data.username.size() <= 80
+        && data.displayName is string
+        && data.displayName.size() <= 120
+        && data.encryptedBackup is string
+        && data.encryptedBackup.size() <= 16000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExpRecord(data, userId, expId) {
+      return data.keys().hasAll([
+          'ownerId', 'expId', 'guildId', 'guildName', 'expNumber', 'expCode',
+          'format', 'status', 'involvedName', 'description', 'whatHappened',
+          'whyWrong', 'tiktokPublishId', 'tiktokStatusText', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'expId', 'guildId', 'guildName', 'expNumber', 'expCode',
+          'format', 'status', 'involvedName', 'description', 'whatHappened',
+          'whyWrong', 'tiktokPublishId', 'tiktokStatusText', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.expId is string
+        && data.expId == expId
+        && data.expId.size() <= 40
+        && data.guildId is string
+        && data.guildId.size() <= 40
+        && data.guildName is string
+        && data.guildName.size() <= 120
+        && data.expNumber is number
+        && data.expNumber >= 0
+        && data.expCode is string
+        && data.expCode.size() <= 32
+        && data.format is string
+        && (data.format == 'carousel' || data.format == 'video')
+        && data.status is string
+        && data.status.size() <= 48
+        && data.involvedName is string
+        && data.involvedName.size() <= 100
+        && data.description is string
+        && data.description.size() <= 240
+        && data.whatHappened is string
+        && data.whatHappened.size() <= 1200
+        && data.whyWrong is string
+        && data.whyWrong.size() <= 800
+        && data.tiktokPublishId is string
+        && data.tiktokPublishId.size() <= 128
+        && data.tiktokStatusText is string
+        && data.tiktokStatusText.size() <= 300
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isVerifiedUser()
+        && isOwner(userId)
+        && isValidId(userId)
+        && (resource == null || existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'discordUserId', 'updatedAt']);
+
+      allow delete: if false;
+
+      match /guildConfigs/{guildId} {
+        allow get: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(guildId)
+          && (resource == null || existing().ownerId == request.auth.uid);
+
+        allow list: if isVerifiedUser()
+          && isOwner(userId)
+          && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(guildId)
+          && isValidGuildConfig(incoming(), userId, guildId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(guildId)
+          && isValidGuildConfig(incoming(), userId, guildId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().guildId == existing().guildId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().diff(existing()).affectedKeys().hasOnly(['guildName', 'discordUserId', 'welcome', 'leave', 'updatedAt']);
+
+        allow delete: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(guildId);
+
+        match /assets/{assetId} {
+          allow get: if isVerifiedUser()
+            && isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guildId)
+            && isValidId(assetId)
+            && get(/databases/$(database)/documents/users/$(userId)/guildConfigs/$(guildId)).data.ownerId == request.auth.uid;
+
+          allow list: if isVerifiedUser()
+            && isOwner(userId)
+            && resource.data.ownerId == request.auth.uid;
+
+          allow create: if isVerifiedUser()
+            && isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guildId)
+            && isValidId(assetId)
+            && isValidGuildAsset(incoming(), userId, guildId, assetId)
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time
+            && get(/databases/$(database)/documents/users/$(userId)/guildConfigs/$(guildId)).data.ownerId == request.auth.uid;
+
+          allow update: if isVerifiedUser()
+            && isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guildId)
+            && isValidId(assetId)
+            && isValidGuildAsset(incoming(), userId, guildId, assetId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().guildId == existing().guildId
+            && incoming().eventType == existing().eventType
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && get(/databases/$(database)/documents/users/$(userId)/guildConfigs/$(guildId)).data.ownerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['dataUrl', 'updatedAt']);
+
+          allow delete: if isVerifiedUser()
+            && isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guildId)
+            && isValidId(assetId)
+            && get(/databases/$(database)/documents/users/$(userId)/guildConfigs/$(guildId)).data.ownerId == request.auth.uid;
+        }
+      }
+
+      match /integrations/{integrationId} {
+        allow get, list: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(integrationId)
+          && (resource == null || existing().ownerId == request.auth.uid);
+
+        allow create: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(integrationId)
+          && isValidTikTokIntegration(incoming(), userId, integrationId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(integrationId)
+          && isValidTikTokIntegration(incoming(), userId, integrationId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().provider == existing().provider
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['username', 'displayName', 'encryptedBackup', 'updatedAt']);
+
+        allow delete: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(integrationId);
+      }
+
+      match /expRecords/{expId} {
+        allow get: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(expId)
+          && (resource == null || existing().ownerId == request.auth.uid);
+
+        allow list: if isVerifiedUser()
+          && isOwner(userId)
+          && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(expId)
+          && isValidExpRecord(incoming(), userId, expId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(expId)
+          && isValidExpRecord(incoming(), userId, expId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().expId == existing().expId
+          && incoming().guildId == existing().guildId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().diff(existing()).affectedKeys().hasOnly(['expNumber', 'expCode', 'status', 'tiktokPublishId', 'tiktokStatusText', 'updatedAt']);
+
+        allow delete: if false;
+      }
+    }
+  }
+}

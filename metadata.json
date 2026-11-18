@@ -1,6 +1,6 @@
 {
-  "name": "Project Phoenix Reforged — Painel Discord",
-  "description": "Painel de controle e gerenciamento para bot Discord real: servidores, canais, cargos, regras, templates e interações /load e Olho do Inferno.",
+  "name": "5573 Satan — Painel Discord & Jogo da Call",
+  "description": "Painel de controle e gerenciamento para o bot 5573 Satan: segurança, antispam e Jogo da Call com vozes do TikTok em português.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -1,683 +1,1159 @@
+import fs from 'node:fs';
 import {
+  AttachmentBuilder,
+  ChannelType,
   Client,
   GatewayIntentBits,
-  Events,
-  ChatInputCommandInteraction,
-  GuildMember,
-  TextChannel,
-} from "discord.js";
+  MessageFlags,
+  Partials,
+  PermissionsBitField,
+  REST,
+  Routes,
+  type Guild,
+  type GuildMember,
+  type PartialGuildMember,
+} from 'discord.js';
 import {
-  selinhoEmbed,
-  tapaNaBundaEmbed,
-  fetchIpData,
-  olhoDoDiaboEmbed,
-  registerCommands,
-  dc,
-} from "../lib/discord.server";
+  getGuildConfig,
+  hasSavedGuildConfig,
+  saveGuildConfig,
+  type BannerEventType,
+} from './configStore.ts';
 import {
-  buildSupportPanelMessage,
-  buildSupportChoiceComponents,
-  buildTicketModal,
-  createTicketChannel,
-  alertAdministrators,
-  closeTicketChannel,
-  deleteAllBotMessagesInGuild,
-  buildIpPanelMessage,
-  createIpTicketChannel,
-  handleIpTicketMessage,
-} from "./tickets";
+  ensureMuralPanelsForGuild,
+  handleMuralButtonInteraction,
+  handleMuralModalInteraction,
+  handleMuralSelectInteraction,
+} from './commands.ts';
 import {
-  handlePollVote,
-  handlePollUnvote,
-  buildVotersEphemeralEmbed,
-  getPoll,
-  closePoll,
-  createPollInChannel,
-} from "./polls";
-import { registerModerationListeners } from "./moderation";
-import { handleAiVoicePrefixMessage } from "./aiVoice";
+  ensureExpPanelForGuild,
+  handleExpButtonInteraction,
+  handleExpModalInteraction,
+} from './expCommands.ts';
+import { renderWelcomeBanner } from './welcomeRenderer.ts';
+import { isGuildTextOrAnnouncement, normalizeDiscordName } from './channelUtils.ts';
 import {
-  handleCallGameReadyClick,
-  handleCallGameOwnerStartClick,
-  handleCallGameVoiceStateUpdate,
-  handleCallGamePrivateMessage,
-  recoverOrphanedCallGameChannelsOnStartup,
-} from "./callGame";
+  assignMemberRoleOnJoin,
+  handleRegistrationButtonInteraction,
+  runFullGuildSync,
+} from './guildSync.ts';
 
-let botClient: Client | null = null;
-let isStarting = false;
-
-export function getBotClient(): Client | null {
-  return botClient;
+export interface BotStatus {
+  configured: boolean;
+  connected: boolean;
+  botTag: string | null;
+  botId: string | null;
+  guildCount: number;
+  error: string | null;
 }
 
-export function isBotOnline(): boolean {
-  return Boolean(botClient && botClient.isReady());
-}
+let discordClient: Client | null = null;
+let botConnectionError: string | null = null;
+let botReady = false;
+let reconnectPromise: Promise<BotStatus> | null = null;
 
-/**
- * Checks if a member in a guild has the 'TRISAL TOTOSO' role
- */
-export function hasTrisalRole(member: GuildMember | any): boolean {
-  if (!member || !member.roles) return false;
-  
-  // If discord.js GuildMember role cache
-  if (member.roles.cache) {
-    return member.roles.cache.some((role: any) => {
-      const n = (role.name || "").toLowerCase().trim();
-      return n === "trisal totoso" || n.includes("trisal totoso");
-    });
+export async function clearAllSlashCommands(
+  applicationId: string,
+  token: string,
+  extraGuildIds: string[] = [],
+): Promise<{ clearedGlobal: boolean; clearedGuilds: number }> {
+  if (!applicationId || !token) {
+    return { clearedGlobal: false, clearedGuilds: 0 };
   }
 
-  // If array of role IDs
-  if (Array.isArray(member.roles)) {
-    return member.roles.length > 0;
-  }
-
-  return false;
-}
-
-export async function initDiscordGatewayBot(): Promise<Client | null> {
-  const token = process.env.DISCORD_BOT_TOKEN?.trim();
-  if (!token) {
-    console.log("[Discord Gateway] DISCORD_BOT_TOKEN não configurado. Bot gateway desativado.");
-    return null;
-  }
-
-  if (isStarting || (botClient && botClient.isReady())) {
-    return botClient;
-  }
-
-  isStarting = true;
+  const rest = new REST({ version: '10' }).setToken(token);
+  let clearedGlobal = false;
+  let clearedGuilds = 0;
 
   try {
-    if (botClient) {
-      try {
-        await botClient.destroy();
-      } catch {}
-      botClient = null;
+    await rest.put(Routes.applicationCommands(applicationId), { body: [] });
+    clearedGlobal = true;
+  } catch (err) {
+    console.warn('[Discord Bot] Aviso ao limpar comandos globais:', (err as Error).message);
+  }
+
+  const guildIds = new Set<string>(extraGuildIds.filter(Boolean));
+  try {
+    const resp = await fetch('https://discord.com/api/v10/users/@me/guilds?limit=200', {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (resp.ok) {
+      const guilds = (await resp.json()) as Array<{ id: string }>;
+      for (const g of guilds) {
+        if (g?.id) guildIds.add(g.id);
+      }
+    }
+  } catch {
+    // Ignore transient REST failure
+  }
+
+  for (const guildId of guildIds) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(applicationId, guildId), { body: [] });
+      clearedGuilds += 1;
+    } catch {
+      // Ignore guild command clearing failure
+    }
+  }
+
+  console.log(
+    `[Discord Bot] Comandos slash (/) removidos: global=${clearedGlobal}, servidores=${clearedGuilds}.`,
+  );
+  return { clearedGlobal, clearedGuilds };
+}
+
+export async function ensureOlhoDoDiaboPanelForGuild(
+  guild: Guild,
+  forceSend = false,
+): Promise<{ sent: boolean; channelId?: string; messageId?: string; reason?: string }> {
+  try {
+    if (guild.channels.cache.size === 0) {
+      await guild.channels.fetch().catch(() => null);
     }
 
-    const client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.MessageContent,
-      ],
+    const textChannels = Array.from(guild.channels.cache.values()).filter(isGuildTextOrAnnouncement);
+
+    const targetChannel =
+      textChannels.find((ch) => ch.id === '1572539485382774814') ||
+      textChannels.find((ch) => {
+        const norm = normalizeDiscordName(ch.name);
+        return norm.includes('olho') || norm.includes('diabo');
+      }) ||
+      textChannels.find((ch) => {
+        const norm = normalizeDiscordName(ch.name);
+        return (
+          norm.includes('buscar-ip') ||
+          norm.includes('bscr-ip') ||
+          norm.includes('puxar-ip')
+        );
+      }) ||
+      textChannels.find((ch) => {
+        const norm = normalizeDiscordName(ch.name);
+        return /(?:^|[^a-z])ip(?:[^a-z]|$)/.test(norm) || norm.includes('consulta');
+      });
+
+    if (!targetChannel) {
+      return { sent: false, reason: 'Canal Olho do Diabo não encontrado.' };
+    }
+
+    const botUserId = guild.client.user?.id;
+    if (!forceSend && botUserId) {
+      const recent = await targetChannel.messages.fetch({ limit: 25 }).catch(() => null);
+      const hasCurrentPanel = recent?.some((msg) => {
+        if (msg.author?.id !== botUserId) return false;
+        const hasIpButton = msg.components?.some((row: any) =>
+          row.components?.some((comp: any) => comp.customId === 'ip_ticket_open'),
+        );
+        const title = msg.embeds?.[0]?.title || '';
+        return Boolean(hasIpButton && title.includes('5573 Satan'));
+      });
+      if (hasCurrentPanel) {
+        return { sent: false, channelId: targetChannel.id, reason: 'Painel já ativo.' };
+      }
+    }
+
+    const { buildIpPanelMessage } = await import('./tickets.ts');
+    const sent = await targetChannel.send(buildIpPanelMessage());
+    console.log(
+      `[Discord Bot] 👁️ Painel Olho do Diabo enviado em #${targetChannel.name} (${targetChannel.id}) no servidor ${guild.name}.`,
+    );
+    return { sent: true, channelId: targetChannel.id, messageId: sent.id };
+  } catch (err) {
+    return {
+      sent: false,
+      reason: err instanceof Error ? err.message : 'Erro ao enviar painel Olho do Diabo.',
+    };
+  }
+}
+
+function formatApiError(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const maybeErr = err as { code?: number | string; message?: string };
+    if (maybeErr.code === 50013) {
+      return 'Permissões insuficientes na API do Discord (Missing Permissions). Verifique se o cargo do bot está acima dos canais/restrições ou possui permissão de Administrador.';
+    }
+    if (maybeErr.code === 50074) {
+      return 'O Discord bloqueou a exclusão de um canal obrigatório de Servidor da Comunidade (ex.: canal de regras ou atualizações).';
+    }
+    if (maybeErr.message) {
+      return maybeErr.message;
+    }
+  }
+  return 'Erro inesperado ao comunicar com a API do Discord.';
+}
+
+function attachBotListeners(client: Client): void {
+  void import('./moderation.ts')
+    .then(({ registerModerationListeners }) => {
+      registerModerationListeners(client);
+    })
+    .catch((err) => {
+      console.error('[Discord Bot] Falha ao ativar moderação avançada:', err);
     });
 
-    client.once(Events.ClientReady, async (c) => {
-      console.log(`[Discord Gateway] ✅ BOT CONECTADO COM SUCESSO: ${c.user.tag}`);
-      c.user.setActivity("💖 /selinho & /tapa-na-bunda | /painel-suporte", { type: 0 }); // Playing
-      
-      // Garante que o Interactions Endpoint URL esteja nulo para que o Discord envie 100% dos eventos para o Gateway
+  client.once('clientReady', async () => {
+    botReady = true;
+    console.log(`[Discord Bot] Conectado como ${client.user?.tag ?? 'Bot'}`);
+
+    const appId = client.user?.id || process.env.DISCORD_APPLICATION_ID?.trim() || '';
+    const token = process.env.DISCORD_BOT_TOKEN?.trim() || '';
+    const guildIds = Array.from(client.guilds.cache.keys());
+    if (appId && token) {
+      void clearAllSlashCommands(appId, token, guildIds).catch(() => {});
+    }
+
+    for (const guild of client.guilds.cache.values()) {
+      const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+      if (me && me.nickname !== '5573 Satan') {
+        await me.setNickname('5573 Satan').catch(() => {});
+      }
+      await runFullGuildSync(guild).catch((err) => {
+        console.error('[Discord Bot] Falha no sync inicial da guild:', err);
+      });
+      void ensureMuralPanelsForGuild(guild).catch(() => {});
+      void ensureExpPanelForGuild(guild).catch(() => {});
+      void ensureOlhoDoDiaboPanelForGuild(guild).catch(() => {});
+    }
+
+    void import('./callGame.ts')
+      .then(({ recoverOrphanedCallGameChannelsOnStartup }) =>
+        recoverOrphanedCallGameChannelsOnStartup(),
+      )
+      .catch(() => {});
+    const snapshot: unknown[] = [];
+    for (const guild of client.guilds.cache.values()) {
       try {
-        await dc("/applications/@me", {
-          method: "PATCH",
-          body: JSON.stringify({ interactions_endpoint_url: null }),
+        const channels = await guild.channels.fetch();
+        const roles = await guild.roles.fetch();
+        const emojis = await guild.emojis.fetch();
+        const botMember = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+        snapshot.push({
+          id: guild.id,
+          name: guild.name,
+          ownerId: guild.ownerId,
+          premiumTier: guild.premiumTier,
+          botId: client.user?.id ?? null,
+          botHighestRolePos: botMember?.roles.highest.position ?? null,
+          botIsAdmin: botMember?.permissions.has(PermissionsBitField.Flags.Administrator) ?? false,
+          roles: Array.from(roles.values())
+            .sort((a, b) => b.position - a.position)
+            .map((r) => ({
+              id: r.id,
+              name: r.name,
+              position: r.position,
+              managed: r.managed,
+              permissions: r.permissions.bitfield.toString(),
+            })),
+          channels: Array.from(channels.values())
+            .filter((c): c is NonNullable<typeof c> => Boolean(c))
+            .sort((a, b) => ('rawPosition' in a ? a.rawPosition : 0) - ('rawPosition' in b ? b.rawPosition : 0))
+            .map((c) => ({
+              id: c.id,
+              name: c.name,
+              type: c.type,
+              parentId: c.parentId,
+              position: 'rawPosition' in c ? c.rawPosition : 0,
+              overwrites:
+                'permissionOverwrites' in c
+                  ? Array.from(c.permissionOverwrites.cache.values()).map((o) => ({
+                      id: o.id,
+                      type: o.type,
+                      allow: o.allow.bitfield.toString(),
+                      deny: o.deny.bitfield.toString(),
+                    }))
+                  : [],
+            })),
+          emojis: Array.from(emojis.values()).map((e) => ({
+            id: e.id,
+            name: e.name,
+            animated: Boolean(e.animated),
+          })),
         });
-        console.log("[Discord Gateway] ✅ interactions_endpoint_url limpo (Gateway ativo)");
-      } catch (e) {
-        console.warn("[Discord Gateway] Aviso ao limpar interactions_endpoint_url:", e);
+      } catch (snapErr) {
+        console.error('[Discord Bot] Snapshot error:', snapErr);
       }
+    }
+    try {
+      fs.writeFileSync('/tmp/discord_guild_snapshot.json', JSON.stringify(snapshot, null, 2));
+    } catch {
+      // Ignore temp snapshot error
+    }
+  });
 
-      // Auto synchronize commands for all guilds the bot is currently in
-      try {
-        const guildIds = c.guilds.cache.map((g) => g.id);
-        console.log(`[Discord Gateway] Sincronizando comandos em ${guildIds.length} servidores...`);
-        for (const gId of guildIds) {
-          await registerCommands(gId).catch((e) => console.warn(`Falha ao registrar comandos na guild ${gId}:`, e));
-        }
-        console.log("[Discord Gateway] ✅ Comandos oficiais sincronizados nos servidores!");
-      } catch (err) {
-        console.warn("[Discord Gateway] Erro na sincronização inicial:", err);
-      }
+  client.on('error', (err) => {
+    console.error('[Discord Bot] Client error:', err);
+    botConnectionError = err.message;
+  });
 
-      // Auto-close any orphaned Jogo da Call channels left over from a site restart/edit/crash & notify SMS
-      try {
-        await recoverOrphanedCallGameChannelsOnStartup();
-      } catch (err) {
-        console.warn("[Discord Gateway] Erro ao recuperar canais órfãos do Jogo da Call:", err);
-      }
-    });
+  client.on('guildMemberAdd', async (member) => {
+    await assignMemberRoleOnJoin(member);
+    await handleMemberBannerEvent(member, 'welcome');
+  });
 
-    // Register Moderação Avançada listeners (Anti-Spam, Timeout & Anti-Rogue Bot)
-    registerModerationListeners(client);
+  client.on('guildMemberRemove', async (member) => {
+    await handleMemberBannerEvent(member, 'leave');
+  });
 
-    // Handle Jogo da Call private player answers, IP lookup ticket channels & n! Groq AI Voice replies
-    client.on(Events.MessageCreate, async (message) => {
-      try {
-        const handledByGame = await handleCallGamePrivateMessage(message);
-        if (handledByGame) return;
-      } catch (err) {
-        console.error("[MessageCreate CallGame error]:", err);
-      }
-      try {
-        await handleIpTicketMessage(message);
-      } catch (err) {
-        console.error("[MessageCreate IP ticket error]:", err);
-      }
-      try {
-        await handleAiVoicePrefixMessage(message);
-      } catch (err) {
-        console.error("[MessageCreate AI Voice error]:", err);
-      }
-    });
+  client.on('voiceStateUpdate', (oldState, newState) => {
+    void import('./callGame.ts')
+      .then(({ handleCallGameVoiceStateUpdate }) => handleCallGameVoiceStateUpdate(oldState, newState))
+      .catch(() => {});
+  });
 
-    // Handle Jogo da Call voice channel joins
-    client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-      try {
-        await handleCallGameVoiceStateUpdate(oldState, newState);
-      } catch (err) {
-        console.error("[VoiceStateUpdate CallGame error]:", err);
-      }
-    });
+  client.on('messageCreate', async (message) => {
+    if (message.author.bot || !message.guild) return;
+    try {
+      const { handleIpTicketMessage } = await import('./tickets.ts');
+      if (await handleIpTicketMessage(message)) return;
 
-    client.on(Events.InteractionCreate, async (interaction) => {
-      // 1. Handle Button interactions for Tickets -> Opens Modal Form screen
-      if (interaction.isButton()) {
+      const { handleCallGamePrivateMessage } = await import('./callGame.ts');
+      if (await handleCallGamePrivateMessage(message)) return;
+
+      const { handleAiVoicePrefixMessage } = await import('./aiVoice.ts');
+      await handleAiVoicePrefixMessage(message);
+    } catch (err) {
+      console.error('[Discord Bot] Erro ao processar mensagem:', err);
+    }
+  });
+
+  client.on('interactionCreate', async (interaction) => {
+    if (interaction.isButton()) {
+      try {
         const customId = interaction.customId;
-        const guild = interaction.guild;
-        const user = interaction.user;
 
-        if (!guild) {
-          await interaction.reply({ content: "Esta ação só pode ser feita em um servidor.", ephemeral: true }).catch(() => {});
+        if (customId.startsWith('exp_')) {
+          await handleExpButtonInteraction(interaction, client);
           return;
         }
 
-        // IP Ticket Button Trigger
-        if (customId === "ip_ticket_open" || customId.startsWith("ip_ticket_")) {
-          await interaction.deferReply({ ephemeral: true }).catch(() => {});
-          try {
-            const { channel, existing } = await createIpTicketChannel(guild, user);
-            if (existing) {
-              await interaction.editReply({
-                content: `⚠️ Você já possui um atendimento de busca de IP aberto: <#${channel.id}>!`,
-              });
-            } else {
-              await interaction.editReply({
-                content: `✅ Seu canal de busca de IP foi criado com sucesso: <#${channel.id}>! Digite o IP lá no chat.`,
-              });
-            }
-          } catch (err) {
-            await interaction.editReply({
-              content: `❌ Erro ao criar canal de busca de IP: ${(err as Error).message}`,
-            }).catch(() => {});
-          }
+        const handledByReg = await handleRegistrationButtonInteraction(interaction);
+        if (handledByReg) return;
+
+        // Tickets & Olho do Diabo
+        if (customId === 'ticket_open_modal') {
+          const { buildTicketModal } = await import('./tickets.ts');
+          await interaction.showModal(buildTicketModal());
           return;
         }
-
-        // Open Support Ticket Modal trigger for any ticket open button
-        if (
-          customId.startsWith("ticket_open") ||
-          customId.startsWith("ticket_create")
-        ) {
-          try {
-            const modal = buildTicketModal();
-            await interaction.showModal(modal);
-          } catch (err) {
-            console.error("[Ticket Modal Error]:", err);
-          }
-          return;
-        }
-
-        if (customId.startsWith("ticket_close_")) {
-          const chanId = customId.replace("ticket_close_", "");
-          const chan = guild.channels.cache.get(chanId) as TextChannel;
-          if (!chan) {
-            await interaction.reply({ content: "Canal de ticket não encontrado.", ephemeral: true }).catch(() => {});
-            return;
-          }
-          await interaction.reply({ content: "🔒 Fechando este ticket...", ephemeral: true }).catch(() => {});
-          await closeTicketChannel(chan, user);
-          return;
-        }
-
-        if (customId.startsWith("ticket_alert_")) {
-          const chanId = customId.replace("ticket_alert_", "");
-          const result = await alertAdministrators(guild, chanId, user);
-          await interaction.reply({ content: result.message, ephemeral: true }).catch(() => {});
-          return;
-        }
-
-        // --- SISTEMA DE ENQUETES ---
-        // 1. Votar em uma opção
-        if (customId.startsWith("poll_vote_")) {
-          const lastUnder = customId.lastIndexOf("_");
-          const optIdx = parseInt(customId.slice(lastUnder + 1), 10);
-          const pollId = customId.slice("poll_vote_".length, lastUnder);
-
-          const result = await handlePollVote(pollId, optIdx, user, interaction.message as any);
-          await interaction.reply({
-            content: result.message,
-            ephemeral: true,
-          }).catch(() => {});
-          return;
-        }
-
-        // 2. Retirar o próprio voto
-        if (customId.startsWith("poll_unvote_")) {
-          const pollId = customId.replace("poll_unvote_", "");
-          const result = await handlePollUnvote(pollId, user, interaction.message as any);
-          await interaction.reply({
-            content: result.message,
-            ephemeral: true,
-          }).catch(() => {});
-          return;
-        }
-
-        // 3. Ver Votos (Mensagem Efêmera com avatar dos votantes e suas opções)
-        if (customId.startsWith("poll_view_")) {
-          const pollId = customId.replace("poll_view_", "");
-          const poll = getPoll(pollId);
-          if (!poll) {
+        if (customId === 'ip_ticket_open') {
+          if (!interaction.guild) {
             await interaction.reply({
-              content: "⚠️ Enquete não encontrada no sistema.",
-              ephemeral: true,
-            }).catch(() => {});
+              content: 'Esta ação só funciona dentro de um servidor.',
+              flags: MessageFlags.Ephemeral,
+            });
             return;
           }
-
-          const votersEmbed = buildVotersEphemeralEmbed(poll);
-          await interaction.reply({
-            embeds: [votersEmbed],
-            ephemeral: true,
-          }).catch(() => {});
-          return;
-        }
-
-        // 4. Encerrar Enquete (Apenas moderadores ou quem criou)
-        if (customId.startsWith("poll_close_")) {
-          const pollId = customId.replace("poll_close_", "");
-          const result = await closePoll(
-            pollId,
-            user,
-            interaction.member as GuildMember,
-            interaction.message as any
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const { createIpTicketChannel } = await import('./tickets.ts');
+          const { channel, existing } = await createIpTicketChannel(
+            interaction.guild,
+            interaction.user,
           );
-          await interaction.reply({
-            content: result.message,
-            ephemeral: true,
-          }).catch(() => {});
+          await interaction.editReply({
+            content: existing
+              ? `👁️ Você já possui um ticket do Olho do Diabo aberto em <#${channel.id}>!`
+              : `👁️ Canal privado do **Olho do Diabo** criado em <#${channel.id}>!`,
+          });
+          return;
+        }
+        if (customId.startsWith('ticket_close_')) {
+          if (!interaction.channel || !interaction.channel.isTextBased() || interaction.channel.isDMBased()) {
+            await interaction.reply({
+              content: 'Este botão só funciona em um canal de ticket.',
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const { closeTicketChannel } = await import('./tickets.ts');
+          await closeTicketChannel(interaction.channel as any, interaction.user);
+          await interaction.editReply({
+            content: '🔒 Ticket encerrado com sucesso. Este canal será excluído em 5 segundos.',
+          });
+          return;
+        }
+        if (customId.startsWith('ticket_alert_')) {
+          if (!interaction.guild) return;
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const { alertAdministrators } = await import('./tickets.ts');
+          const result = await alertAdministrators(
+            interaction.guild,
+            interaction.channelId,
+            interaction.user,
+          );
+          await interaction.editReply({ content: result.message });
           return;
         }
 
-        // Jogo da Call: Botão "Estou Pronto"
-        if (customId.startsWith("callgame_ready:")) {
-          await handleCallGameReadyClick(interaction);
-          return;
+        // Jogo da Call (CallGame)
+        if (customId.startsWith('callgame_')) {
+          const callGame = await import('./callGame.ts');
+          if (customId.startsWith('callgame_ready:')) {
+            await callGame.handleCallGameReadyClick(interaction);
+            return;
+          }
+          if (customId.startsWith('callgame_open_name_modal:')) {
+            await callGame.handleCallGameOpenNameModal(interaction);
+            return;
+          }
+          if (customId.startsWith('callgame_cycle_voice:')) {
+            await callGame.handleCallGameCycleVoice(interaction);
+            return;
+          }
+          if (customId.startsWith('callgame_set_gender:m:')) {
+            await callGame.handleCallGameSetGender(interaction, 'm');
+            return;
+          }
+          if (customId.startsWith('callgame_set_gender:f:')) {
+            await callGame.handleCallGameSetGender(interaction, 'f');
+            return;
+          }
+          if (customId.startsWith('callgame_confirm_ready:')) {
+            await callGame.handleCallGameConfirmReady(interaction);
+            return;
+          }
+          if (customId.startsWith('callgame_owner_start:')) {
+            await callGame.handleCallGameOwnerStartClick(interaction);
+            return;
+          }
+          if (customId.startsWith('callgame_open_answer_modal:')) {
+            await callGame.handleCallGameOpenAnswerModal(interaction);
+            return;
+          }
         }
 
-        // Jogo da Call: Botão Exclusivo do Dono "Começar Tudo"
-        if (customId.startsWith("callgame_owner_start:")) {
-          await handleCallGameOwnerStartClick(interaction);
-          return;
-        }
-
-        return;
-      }
-
-      // 2. Handle Modal Submissions for Tickets (Form Screen)
-      if (interaction.isModalSubmit()) {
-        const customId = interaction.customId;
-        const guild = interaction.guild;
-        const user = interaction.user;
-
-        if (!guild) {
-          await interaction.reply({ content: "Esta ação só pode ser feita em um servidor.", ephemeral: true }).catch(() => {});
-          return;
-        }
-
-        if (customId === "ticket_modal_submit" || customId.startsWith("ticket_modal_")) {
-          const subject = interaction.fields.getTextInputValue("ticket_subject")?.trim() || "Geral";
-          const content = interaction.fields.getTextInputValue("ticket_content")?.trim() || "";
-
-          // Immediate acknowledgement so Discord doesn't timeout the modal submission
-          await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-          try {
-            const { channel, existing } = await createTicketChannel(
-              guild,
-              user,
-              content,
-              subject
+        // Enquetes (Polls)
+        if (customId.startsWith('poll_')) {
+          const polls = await import('./polls.ts');
+          if (customId.startsWith('poll_vote_')) {
+            const withoutPrefix = customId.slice('poll_vote_'.length);
+            const lastIdx = withoutPrefix.lastIndexOf('_');
+            const pollId = lastIdx > 0 ? withoutPrefix.slice(0, lastIdx) : withoutPrefix;
+            const optionIndex = lastIdx > 0 ? Number(withoutPrefix.slice(lastIdx + 1)) : -1;
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const res = await polls.handlePollVote(
+              pollId,
+              optionIndex,
+              interaction.user,
+              interaction.message,
             );
-
-            if (existing) {
-              await interaction.editReply({
-                content: `⚠️ Você já possui um atendimento em andamento: <#${channel.id}>! Acesse o canal para continuar.`,
+            await interaction.editReply({ content: res.message });
+            return;
+          }
+          if (customId.startsWith('poll_view_')) {
+            const pollId = customId.slice('poll_view_'.length);
+            const poll = polls.getPoll(pollId);
+            if (!poll) {
+              await interaction.reply({
+                content: '⚠️ Enquete não encontrada.',
+                flags: MessageFlags.Ephemeral,
               });
               return;
             }
-
-            await interaction.editReply({
-              content: `✅ **Seu chamado foi criado com sucesso:** <#${channel.id}>\n📩 O conteúdo do seu chamado foi enviado para os administradores!`,
-            });
-          } catch (err) {
-            console.error("[Ticket Modal Submission Error]:", err);
-            await interaction.editReply({
-              content: `❌ Falha ao criar seu atendimento: ${(err as Error).message}`,
-            });
-          }
-          return;
-        }
-
-        return;
-      }
-
-      if (!interaction.isChatInputCommand()) return;
-
-      const cmd = interaction.commandName.toLowerCase().replace(/_/g, "-");
-      const user = interaction.user;
-      const member = interaction.member;
-
-      console.log(`[Discord Gateway] Slash Command recebido: /${cmd} de ${user.tag} (${user.id})`);
-
-      // 1. Resposta imediata em <50ms para EVITAR "O bot não respondeu" no Discord
-      try {
-        await interaction.deferReply().catch((e) => console.error("[Discord] Erro ao dar deferReply:", e));
-      } catch (err) {
-        console.error("[Discord] Defer falhou:", err);
-      }
-
-      try {
-        // Helper para verificar se o usuário é Administrador ou Moderador
-        const isStaffOrAdmin = (g: any, m: any, uId: string): boolean => {
-          if (!g) return false;
-          if (g.ownerId === uId) return true;
-          if (!m) return false;
-          const gm = m as GuildMember;
-          if (gm.permissions && typeof (gm.permissions as any).has === "function") {
-            if (
-              (gm.permissions as any).has("Administrator") ||
-              (gm.permissions as any).has("ManageGuild") ||
-              (gm.permissions as any).has("ManageChannels") ||
-              (gm.permissions as any).has("ModerateMembers")
-            ) {
-              return true;
-            }
-          }
-          if (gm.roles?.cache) {
-            const hasStaffRole = gm.roles.cache.some((r) => {
-              const n = (r.name || "").toLowerCase();
-              return (
-                n.includes("admin") ||
-                n.includes("mod") ||
-                n.includes("staff") ||
-                n.includes("gerente") ||
-                n.includes("dono") ||
-                n.includes("coord")
-              );
-            });
-            if (hasStaffRole) return true;
-          }
-          return false;
-        };
-
-        const isPainelSuporte = cmd === "painel-suporte" || cmd === "suporte";
-        const isPainelIp = cmd === "painel-ip" || cmd === "ip-painel" || cmd === "buscar-ip-painel";
-        const isApagarTickets = cmd === "apagar-tickets" || cmd === "limpar-tickets" || cmd === "apagar_tickets" || cmd === "limpar_tickets" || cmd === "apagar-ticket";
-        const isSelinho = cmd === "selinho";
-        const isTapa = cmd === "tapa-na-bunda" || cmd === "tapanabunda";
-        const isFalar = cmd === "falar";
-        const isOlhoDoDiabo = cmd === "olho-do-diabo" || cmd === "buscar-ip" || cmd === "ip-embed" || cmd === "ip_embed" || cmd === "ip";
-        const isEnquete = cmd === "enquete" || cmd === "poll";
-        const isSpamTest = cmd === "spam";
-        const isBlockTest = cmd === "testar-bloqueio" || cmd === "teste-sistema";
-
-        // Avisa sobre comandos desativados
-        if (["beijo-triplo", "beijotriplo", "alizar", "alisar", "load", "regras", "enviar-embed", "embed"].includes(cmd)) {
-          await interaction.editReply({
-            content: "⚠️ **Este comando foi desativado!**\nUse os comandos oficiais disponíveis: `/selinho`, `/tapa-na-bunda`, `/falar`, `/olho-do-diabo`, `/painel-suporte`, `/painel-ip` ou `/apagar-tickets`.",
-          });
-          return;
-        }
-
-        if (isPainelIp) {
-          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
-          if (!hasPerm) {
-            await interaction.editReply({
-              content: "🚫 **ACESSO NEGADO!**\nO comando `/painel-ip` é restrito a **Administradores e Moderadores** do servidor.",
+            await interaction.reply({
+              embeds: [polls.buildVotersEphemeralEmbed(poll)],
+              flags: MessageFlags.Ephemeral,
             });
             return;
           }
-
-          const channel = interaction.channel as TextChannel;
-          if (!channel) {
-            await interaction.editReply({ content: "Canal inválido para enviar o painel Olho do Diabo." });
+          if (customId.startsWith('poll_unvote_')) {
+            const pollId = customId.slice('poll_unvote_'.length);
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const res = await polls.handlePollUnvote(pollId, interaction.user, interaction.message);
+            await interaction.editReply({ content: res.message });
             return;
           }
-
-          const panel = buildIpPanelMessage();
-          await channel.send(panel);
-          await interaction.editReply({ content: "✅ **Painel Olho do Diabo de Busca de IP enviado com sucesso neste canal!**" });
-          return;
-        }
-
-        if (isPainelSuporte) {
-          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
-          if (!hasPerm) {
-            await interaction.editReply({
-              content: "🚫 **ACESSO NEGADO!**\nO comando `/painel-suporte` é restrito a **Administradores e Moderadores** do servidor.",
-            });
-            return;
-          }
-
-          const channel = interaction.channel as TextChannel;
-          if (!channel) {
-            await interaction.editReply({ content: "Canal inválido para enviar o painel." });
-            return;
-          }
-
-          const panel = buildSupportPanelMessage();
-          await channel.send(panel);
-          await interaction.editReply({ content: "✅ **Painel de Suporte enviado com sucesso neste canal!**" });
-          return;
-        }
-
-        if (isApagarTickets) {
-          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
-          if (!hasPerm) {
-            await interaction.editReply({
-              content: "🚫 **ACESSO NEGADO!**\nO comando `/apagar-tickets` é restrito a **Administradores e Moderadores** do servidor.",
-            });
-            return;
-          }
-
-          const modo = interaction.options.getString("modo", false) || "canal";
-          const guild = interaction.guild;
-          if (!guild || !botClient?.user) {
-            await interaction.editReply({ content: "⚠️ Servidor ou bot não acessível." });
-            return;
-          }
-
-          const isAll = modo === "todos";
-          await interaction.editReply({
-            content: isAll
-              ? "🧹 **Iniciando limpeza geral...** Apagando todas as mensagens do bot e painéis de tickets (antigos e novos) em todos os canais de texto do servidor..."
-              : "🧹 **Iniciando limpeza...** Apagando todas as mensagens do bot e painéis de tickets (antigos e novos) neste canal...",
-          });
-
-          try {
-            const res = await deleteAllBotMessagesInGuild(
-              guild,
-              botClient.user.id,
-              isAll ? undefined : interaction.channelId,
-              false
+          if (customId.startsWith('poll_close_')) {
+            const pollId = customId.slice('poll_close_'.length);
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const res = await polls.closePoll(
+              pollId,
+              interaction.user,
+              interaction.member as GuildMember | null,
+              interaction.message,
             );
-
-            await interaction.editReply({
-              content: `✅ **Limpeza de Tickets e Mensagens Concluída com Sucesso!**\n🗑️ Foram apagadas **${res.totalDeleted} mensagem(ns)** do bot em **${res.channelsProcessed} canal(is)**.`,
-            });
-          } catch (err) {
-            await interaction.editReply({
-              content: `⚠️ Erro ao apagar mensagens: ${(err as Error).message}`,
-            });
-          }
-          return;
-        }
-
-        // SELINHO (Aberto para todos os membros)
-        if (isSelinho) {
-          if (!interaction.guildId || !member) {
-            await interaction.editReply({
-              content: "Este comando só pode ser utilizado dentro de um servidor Discord!",
-            });
+            await interaction.editReply({ content: res.message });
             return;
           }
-          const target = interaction.options.getUser("user", true);
-          const embed = selinhoEmbed(user.id, target.id);
-          await interaction.editReply({ embeds: [embed] });
-          return;
         }
 
-        // TAPA NA BUNDA (Aberto para todos os membros)
-        if (isTapa) {
-          if (!interaction.guildId || !member) {
-            await interaction.editReply({
-              content: "Este comando só pode ser utilizado dentro de um servidor Discord!",
-            });
-            return;
-          }
-          const target = interaction.options.getUser("user", true);
-          const embed = tapaNaBundaEmbed(user.id, target.id);
-          await interaction.editReply({ embeds: [embed] });
-          return;
-        }
-
-        if (isFalar) {
-          const texto = interaction.options.getString("texto", true);
-          const memberVoice = (interaction.member as GuildMember)?.voice;
-          const voiceChannelId = memberVoice?.channelId;
-
-          let voiceResult: string | null = null;
-          let voiceName: string = "Dubladora Anime (Lhays)";
-          if (interaction.guildId) {
-            try {
-              const { speakInVoiceCall } = await import("./voice");
-              const res = await speakInVoiceCall(interaction.guildId, texto, voiceChannelId || undefined, "lhays_anime");
-              voiceResult = res.channelName;
-              voiceName = res.voiceUsed;
-            } catch (err) {
-              console.log("[Voice Speak Notice]:", (err as Error).message);
-            }
-          }
-
-          await interaction.editReply({
-            content: voiceResult
-              ? `🧚 **Voz CapCut: ${voiceName} transmitindo na call "${voiceResult}"!** (escuta desligada 🎧🔇)\n> *"${texto}"*`
-              : `🔊 Fala transmitida: *"${texto}"*`,
-          });
-          return;
-        }
-
-        if (isOlhoDoDiabo) {
-          const ipParam = interaction.options.getString("alvo", false) || interaction.options.getString("ip", false) || interaction.options.getString("ip_ou_dominio", false) || interaction.options.getString("texto", false) || "8.8.8.8";
-          const data = await fetchIpData(ipParam);
-          const embed = olhoDoDiaboEmbed(data, user.tag);
-          await interaction.editReply({ embeds: [embed] });
-          return;
-        }
-
-        if (isEnquete) {
-          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
-          if (!hasPerm) {
-            await interaction.editReply({
-              content: "🚫 **ACESSO NEGADO!**\nO comando `/enquete` é restrito a **Administradores e Moderadores** do servidor.",
-            });
-            return;
-          }
-
-          const channel = interaction.channel as TextChannel;
-          if (!channel) {
-            await interaction.editReply({ content: "⚠️ Canal inválido para criar a enquete." });
-            return;
-          }
-
-          const pergunta = interaction.options.getString("pergunta", true);
-          const op1 = interaction.options.getString("opcao1", true);
-          const op2 = interaction.options.getString("opcao2", true);
-          const op3 = interaction.options.getString("opcao3", false);
-          const op4 = interaction.options.getString("opcao4", false);
-          const op5 = interaction.options.getString("opcao5", false);
-
-          const rawOptions = [op1, op2, op3, op4, op5].filter(Boolean) as string[];
-
-          try {
-            await createPollInChannel(channel, user, pergunta, rawOptions);
-            await interaction.editReply({
-              content: `📊 **Enquete publicada com sucesso neste canal!**\n> 📋 **Pergunta:** *"${pergunta}"*\n> 🔢 **Opções (${rawOptions.length}):** ${rawOptions.map((o, i) => `[${i + 1}] ${o}`).join(" • ")}`,
-            });
-          } catch (err) {
-            await interaction.editReply({
-              content: `⚠️ Falha ao criar enquete: ${(err as Error).message}`,
-            });
-          }
-          return;
-        }
-
-        if (isSpamTest || isBlockTest) {
-          const hasPerm = isStaffOrAdmin(interaction.guild, member, user.id);
-          if (!hasPerm) {
-            await interaction.editReply({
-              content: "🚫 **ACESSO NEGADO!**\nO comando de teste de bloqueio é restrito a **Administradores e Moderadores** do servidor.",
-            });
-            return;
-          }
-
-          if (!interaction.guildId || !interaction.channelId) {
-            await interaction.editReply({ content: "⚠️ Este comando só pode ser usado dentro de um canal do servidor." });
-            return;
-          }
-
-          const { runSecurityTest } = await import("./testBot");
-          const rawType = isSpamTest
-            ? interaction.options.getString("tipo", false) || "spam"
-            : interaction.options.getString("sistema", false) || "all";
-          const testType = (["spam", "invite", "massping", "raid", "all"].includes(rawType) ? rawType : "spam") as
-            | "spam"
-            | "invite"
-            | "massping"
-            | "raid"
-            | "all";
-          const customText = isSpamTest ? interaction.options.getString("texto", false) || undefined : undefined;
-
-          const result = await runSecurityTest(interaction.guildId, interaction.channelId, testType, customText);
-          const adminTip = result.hasAdminWarning
-            ? "\n\n⚠️ **Aviso:** O 2º Bot de Testes está com permissão **Administrador** neste servidor. Para ele deixar de ver todos os canais e enxergar **APENAS** `#spam-não` durante o castigo, remova o cargo de Administrador dele (ou reconvide pelo link sem Admin no painel)."
-            : "";
-
-          await interaction.editReply({
-            content: `🧪 **Teste de Sistema Iniciado!**\n${result.message}${adminTip}`,
-          });
-          return;
-        }
-
-        await interaction.editReply({
-          content: `Comando não reconhecido. Comandos oficiais disponíveis: \`/spam\`, \`/testar-bloqueio\`, \`/enquete\`, \`/selinho\`, \`/tapa-na-bunda\`, \`/falar\`, \`/olho-do-diabo\`, \`/painel-suporte\`, \`/painel-ip\`, \`/apagar-tickets\`.`,
-        });
+        await handleMuralButtonInteraction(interaction, client);
       } catch (err) {
-        console.error("[Interaction execution error]:", err);
-        await interaction.editReply({
-          content: `⚠️ Erro ao processar o comando: ${(err as Error).message}`,
-        }).catch(() => {});
+        console.error('[Discord Bot] Erro no botão:', err);
+        const errPayload = {
+          content: 'Não foi possível processar esta ação no momento. Tente novamente.',
+          flags: MessageFlags.Ephemeral,
+        } as const;
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp(errPayload).catch(() => {});
+        } else {
+          await interaction.reply(errPayload).catch(() => {});
+        }
       }
-    });
+      return;
+    }
 
-    client.on("error", (err) => {
-      console.error("[Discord Gateway Error]:", err);
-    });
+    if (interaction.isStringSelectMenu()) {
+      try {
+        await handleMuralSelectInteraction(interaction);
+      } catch (err) {
+        console.error('[Discord Bot] Erro na seleção de mural:', err);
+      }
+      return;
+    }
 
-    await client.login(token);
-    botClient = client;
-    return client;
+    if (interaction.isModalSubmit()) {
+      try {
+        const customId = interaction.customId;
+        if (customId === 'ticket_modal_submit') {
+          if (!interaction.guild) {
+            await interaction.reply({
+              content: 'Esta ação só funciona dentro de um servidor.',
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const subject = interaction.fields.getTextInputValue('ticket_subject')?.trim();
+          const content = interaction.fields.getTextInputValue('ticket_content')?.trim();
+          const { createTicketChannel } = await import('./tickets.ts');
+          const { channel, existing } = await createTicketChannel(
+            interaction.guild,
+            interaction.user,
+            content,
+            subject,
+          );
+          await interaction.editReply({
+            content: existing
+              ? `🎫 Você já possui um ticket aberto em <#${channel.id}>!`
+              : `🎫 Ticket criado com sucesso em <#${channel.id}>!`,
+          });
+          return;
+        }
+        if (customId.startsWith('callgame_modal_name:')) {
+          const { handleCallGameNameModalSubmit } = await import('./callGame.ts');
+          await handleCallGameNameModalSubmit(interaction);
+          return;
+        }
+        if (customId.startsWith('callgame_modal_answer:')) {
+          const { handleCallGameAnswerModalSubmit } = await import('./callGame.ts');
+          await handleCallGameAnswerModalSubmit(interaction);
+          return;
+        }
+
+        const handledByExp = await handleExpModalInteraction(interaction);
+        if (!handledByExp) {
+          await handleMuralModalInteraction(interaction);
+        }
+      } catch (err) {
+        console.error('[Discord Bot] Erro no modal:', err);
+        const errPayload = {
+          content: 'Ocorreu um erro ao processar o formulário enviado. Tente novamente.',
+          flags: MessageFlags.Ephemeral,
+        } as const;
+        if (interaction.deferred) {
+          await interaction.editReply({ content: errPayload.content }).catch(() => {});
+        } else if (interaction.replied) {
+          await interaction.followUp(errPayload).catch(() => {});
+        } else {
+          await interaction.reply(errPayload).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+
+    await interaction
+      .reply({
+        content: 'Todos os comandos de barra (/) deste bot foram removidos.',
+        flags: MessageFlags.Ephemeral,
+      })
+      .catch(() => {});
+  });
+}
+
+export async function initializeDiscordBot(): Promise<void> {
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  const applicationId = process.env.DISCORD_APPLICATION_ID?.trim();
+
+  if (!token || !applicationId) {
+    botConnectionError = 'DISCORD_BOT_TOKEN ou DISCORD_APPLICATION_ID não configurados.';
+    botReady = false;
+    return;
+  }
+
+  try {
+    await clearAllSlashCommands(applicationId, token);
   } catch (err) {
-    console.error("[Discord Gateway] Falha ao iniciar bot client:", err);
-    botClient = null;
-    return null;
-  } finally {
-    isStarting = false;
+    console.warn('[Discord Bot] Falha ao limpar comandos slash:', err);
+  }
+
+  const primaryClient = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildVoiceStates,
+    ],
+    partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
+  });
+  attachBotListeners(primaryClient);
+  discordClient = primaryClient;
+
+  try {
+    await primaryClient.login(token);
+    botConnectionError = null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Falha ao autenticar o bot no Discord.';
+    if (message.toLowerCase().includes('disallowed intents')) {
+      console.warn(
+        '[Discord Bot] Intents privilegiadas desativadas no Portal do Discord. Conectando com intents padrão.',
+      );
+      await primaryClient.destroy().catch(() => {});
+
+      const secondaryClient = new Client({
+        intents: [
+          GatewayIntentBits.Guilds,
+          GatewayIntentBits.GuildMessages,
+          GatewayIntentBits.GuildVoiceStates,
+        ],
+        partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
+      });
+      attachBotListeners(secondaryClient);
+      discordClient = secondaryClient;
+
+      try {
+        await secondaryClient.login(token);
+        botConnectionError = null;
+      } catch (secondaryErr) {
+        const secMsg =
+          secondaryErr instanceof Error
+            ? secondaryErr.message
+            : 'Falha ao autenticar o bot no Discord.';
+        if (secMsg.toLowerCase().includes('disallowed intents')) {
+          await secondaryClient.destroy().catch(() => {});
+          const fallbackClient = new Client({
+            intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+            partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
+          });
+          attachBotListeners(fallbackClient);
+          discordClient = fallbackClient;
+          try {
+            await fallbackClient.login(token);
+            botConnectionError = null;
+          } catch (fallbackErr) {
+            botReady = false;
+            botConnectionError =
+              fallbackErr instanceof Error
+                ? fallbackErr.message
+                : 'Falha ao autenticar o bot no Discord.';
+            console.error('[Discord Bot] Falha no login fallback:', botConnectionError);
+          }
+        } else {
+          botReady = false;
+          botConnectionError = secMsg;
+          console.error('[Discord Bot] Falha no login secundário:', botConnectionError);
+        }
+      }
+    } else {
+      botReady = false;
+      botConnectionError = message;
+      console.error('[Discord Bot] Falha no login:', botConnectionError);
+    }
   }
 }
+
+export function getBotStatus(): BotStatus {
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  const applicationId = process.env.DISCORD_APPLICATION_ID?.trim();
+  const configured = Boolean(token && applicationId);
+
+  return {
+    configured,
+    connected: botReady && Boolean(discordClient?.isReady()),
+    botTag: discordClient?.user?.tag ?? null,
+    botId: discordClient?.user?.id ?? null,
+    guildCount: discordClient?.guilds.cache.size ?? 0,
+    error: botConnectionError,
+  };
+}
+
+export async function reconnectDiscordBot(): Promise<BotStatus> {
+  if (reconnectPromise) {
+    return reconnectPromise;
+  }
+
+  reconnectPromise = (async () => {
+    try {
+      if (discordClient) {
+        await discordClient.destroy().catch(() => {});
+        discordClient = null;
+      }
+      botReady = false;
+      botConnectionError = null;
+      await initializeDiscordBot();
+      return getBotStatus();
+    } finally {
+      reconnectPromise = null;
+    }
+  })();
+
+  return reconnectPromise;
+}
+
+export async function fetchBotGuildIds(): Promise<Set<string>> {
+  const ids = new Set<string>();
+
+  if (discordClient?.isReady()) {
+    for (const guildId of discordClient.guilds.cache.keys()) {
+      ids.add(guildId);
+    }
+    return ids;
+  }
+
+  // Fallback via Discord REST API if bot token is set but WebSocket is still connecting
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  if (!token) return ids;
+
+  try {
+    const response = await fetch('https://discord.com/api/v10/users/@me/guilds?limit=200', {
+      headers: {
+        Authorization: `Bot ${token}`,
+      },
+    });
+    if (response.ok) {
+      const guilds = (await response.json()) as Array<{ id: string }>;
+      for (const g of guilds) {
+        ids.add(g.id);
+      }
+    }
+  } catch {
+    // Ignore transient REST error
+  }
+
+  return ids;
+}
+
+export interface BotGuildSummary {
+  id: string;
+  name: string;
+  iconUrl: string | null;
+  owner: boolean;
+}
+
+export async function fetchBotGuildsSummary(): Promise<BotGuildSummary[]> {
+  if (discordClient?.isReady()) {
+    const list: BotGuildSummary[] = [];
+    for (const guild of discordClient.guilds.cache.values()) {
+      list.push({
+        id: guild.id,
+        name: guild.name,
+        iconUrl: guild.iconURL({ extension: 'png', size: 128 }),
+        owner: guild.ownerId === discordClient.user?.id,
+      });
+    }
+    return list.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+  }
+
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  if (!token) return [];
+
+  try {
+    const response = await fetch('https://discord.com/api/v10/users/@me/guilds?limit=200', {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (!response.ok) return [];
+    const rawGuilds = (await response.json()) as Array<{
+      id: string;
+      name: string;
+      icon: string | null;
+      owner?: boolean;
+    }>;
+    return rawGuilds
+      .map((g) => ({
+        id: g.id,
+        name: g.name,
+        iconUrl: g.icon
+          ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.${g.icon.startsWith('a_') ? 'gif' : 'png'}?size=128`
+          : null,
+        owner: Boolean(g.owner),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+  } catch {
+    return [];
+  }
+}
+
+export interface GuildTextChannelItem {
+  id: string;
+  name: string;
+  categoryName: string | null;
+}
+
+export async function fetchGuildTextChannels(guildId: string): Promise<GuildTextChannelItem[]> {
+  if (discordClient?.isReady()) {
+    const guild = await discordClient.guilds.fetch(guildId).catch(() => null);
+    if (guild) {
+      const channels = await guild.channels.fetch();
+      const categories = new Map<string, string>();
+      for (const ch of channels.values()) {
+        if (ch && ch.type === ChannelType.GuildCategory) {
+          categories.set(ch.id, ch.name);
+        }
+      }
+
+      const textChannels: Array<GuildTextChannelItem & { position: number }> = [];
+      for (const ch of channels.values()) {
+        if (
+          ch &&
+          (ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement)
+        ) {
+          textChannels.push({
+            id: ch.id,
+            name: ch.name,
+            categoryName: ch.parentId ? (categories.get(ch.parentId) ?? null) : null,
+            position: 'rawPosition' in ch ? ch.rawPosition : 0,
+          });
+        }
+      }
+
+      textChannels.sort((a, b) => a.position - b.position);
+      return textChannels.map(({ id, name, categoryName }) => ({ id, name, categoryName }));
+    }
+  }
+
+  // Fallback to Bot REST API if WebSocket is not ready yet
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  if (!token) return [];
+
+  const resp = await fetch(`https://discord.com/api/v10/guilds/${guildId}/channels`, {
+    headers: { Authorization: `Bot ${token}` },
+  });
+  if (!resp.ok) return [];
+
+  const rawChannels = (await resp.json()) as Array<{
+    id: string;
+    name: string;
+    type: number;
+    parent_id: string | null;
+    position: number;
+  }>;
+
+  const categories = new Map<string, string>();
+  for (const ch of rawChannels) {
+    if (ch.type === ChannelType.GuildCategory) {
+      categories.set(ch.id, ch.name);
+    }
+  }
+
+  return rawChannels
+    .filter((ch) => ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement)
+    .sort((a, b) => a.position - b.position)
+    .map((ch) => ({
+      id: ch.id,
+      name: ch.name,
+      categoryName: ch.parent_id ? (categories.get(ch.parent_id) ?? null) : null,
+    }));
+}
+
+export interface GuildChannelFullItem {
+  id: string;
+  name: string;
+  type: number;
+  categoryName: string | null;
+  memberCount: number;
+}
+
+export async function fetchGuildAllChannels(guildId: string): Promise<GuildChannelFullItem[]> {
+  if (discordClient?.isReady()) {
+    const guild = await discordClient.guilds.fetch(guildId).catch(() => null);
+    if (guild) {
+      const channels = await guild.channels.fetch();
+      const categories = new Map<string, string>();
+      for (const ch of channels.values()) {
+        if (ch && ch.type === ChannelType.GuildCategory) {
+          categories.set(ch.id, ch.name);
+        }
+      }
+
+      const items: Array<GuildChannelFullItem & { position: number }> = [];
+      for (const ch of channels.values()) {
+        if (!ch || ch.type === ChannelType.GuildCategory) continue;
+        items.push({
+          id: ch.id,
+          name: ch.name,
+          type: ch.type,
+          categoryName: ch.parentId ? (categories.get(ch.parentId) ?? null) : null,
+          memberCount: ch.isVoiceBased() ? ch.members.size : 0,
+          position: 'rawPosition' in ch ? ch.rawPosition : 0,
+        });
+      }
+
+      items.sort((a, b) => a.position - b.position);
+      return items.map(({ id, name, type, categoryName, memberCount }) => ({
+        id,
+        name,
+        type,
+        categoryName,
+        memberCount,
+      }));
+    }
+  }
+
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
+  if (!token) return [];
+
+  const resp = await fetch(`https://discord.com/api/v10/guilds/${guildId}/channels`, {
+    headers: { Authorization: `Bot ${token}` },
+  });
+  if (!resp.ok) return [];
+
+  const rawChannels = (await resp.json()) as Array<{
+    id: string;
+    name: string;
+    type: number;
+    parent_id: string | null;
+    position: number;
+  }>;
+
+  const categories = new Map<string, string>();
+  for (const ch of rawChannels) {
+    if (ch.type === ChannelType.GuildCategory) {
+      categories.set(ch.id, ch.name);
+    }
+  }
+
+  return rawChannels
+    .filter((ch) => ch.type !== ChannelType.GuildCategory)
+    .sort((a, b) => a.position - b.position)
+    .map((ch) => ({
+      id: ch.id,
+      name: ch.name,
+      type: ch.type,
+      categoryName: ch.parent_id ? (categories.get(ch.parent_id) ?? null) : null,
+      memberCount: 0,
+    }));
+}
+
+async function handleMemberBannerEvent(
+  member: GuildMember | PartialGuildMember,
+  eventType: BannerEventType,
+): Promise<void> {
+  try {
+    const guild = member.guild;
+    const config = getGuildConfig(guild.id);
+    const rule = eventType === 'welcome' ? config.welcome : config.leave;
+
+    if (!rule.enabled || !rule.channelId) return;
+
+    const channel = await guild.channels.fetch(rule.channelId).catch(() => null);
+    if (
+      !channel ||
+      (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)
+    ) {
+      return;
+    }
+
+    const botMember = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+    if (botMember) {
+      const perms = channel.permissionsFor(botMember);
+      if (
+        !perms?.has(PermissionsBitField.Flags.ViewChannel) ||
+        !perms?.has(PermissionsBitField.Flags.SendMessages) ||
+        !perms?.has(PermissionsBitField.Flags.AttachFiles)
+      ) {
+        return;
+      }
+    }
+
+    const resolvedUser =
+      member.user && !member.user.partial && member.user.username
+        ? member.user
+        : await member.client.users.fetch(member.id).catch(() => member.user ?? null);
+
+    const displayName =
+      member.displayName || resolvedUser?.globalName || resolvedUser?.username || 'Membro';
+    const username = resolvedUser?.username || displayName;
+    const avatarUrl =
+      resolvedUser?.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true }) ?? null;
+
+    console.log(
+      `[Discord Bot] Evento ${eventType === 'welcome' ? 'guildMemberAdd -> Entrada' : 'guildMemberRemove -> Saída'} | servidor "${guild.name}" (${guild.id}) | canal #${channel.name} (${channel.id}) | título "${rule.title}" | membro ${displayName} (${member.id})`,
+    );
+
+    const pngBuffer = await renderWelcomeBanner({
+      title: rule.title,
+      message: rule.message,
+      memberDisplayName: displayName,
+      memberUsername: username,
+      guildName: guild.name,
+      memberCount: guild.memberCount,
+      avatarUrl,
+      imageFilename: rule.imageFilename,
+    });
+
+    const filename = eventType === 'welcome' ? 'boas-vindas.png' : 'despedida.png';
+    await channel.send({
+      content: `<@${member.id}>`,
+      files: [new AttachmentBuilder(pngBuffer, { name: filename })],
+      allowedMentions:
+        eventType === 'welcome' ? { users: [member.id] } : { parse: [] },
+    });
+  } catch (err) {
+    console.error(`[Discord Bot] Falha ao enviar imagem de ${eventType}:`, err);
+  }
+}
+
+export async function sendTestWelcomeBanner(options: {
+  guildId: string;
+  eventType: BannerEventType;
+  channelId: string;
+  title: string;
+  message: string;
+  memberUserId: string;
+  memberDisplayName: string;
+  memberUsername: string;
+  avatarUrl: string | null;
+  imageFilename: string | null;
+}): Promise<{ ok: boolean; error?: string }> {
+  try {
+    let guildName = 'Servidor';
+    let memberCount = 1;
+
+    if (discordClient?.isReady()) {
+      const guild = await discordClient.guilds.fetch(options.guildId).catch(() => null);
+      if (!guild) {
+        return { ok: false, error: 'Servidor não encontrado pelo bot.' };
+      }
+
+      guildName = guild.name;
+      memberCount = guild.memberCount;
+
+      const channel = await guild.channels.fetch(options.channelId).catch(() => null);
+      if (
+        !channel ||
+        (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)
+      ) {
+        return { ok: false, error: 'Canal de texto inválido ou não encontrado.' };
+      }
+
+      const botMember = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+      if (botMember) {
+        const perms = channel.permissionsFor(botMember);
+        if (
+          !perms?.has(PermissionsBitField.Flags.ViewChannel) ||
+          !perms?.has(PermissionsBitField.Flags.SendMessages) ||
+          !perms?.has(PermissionsBitField.Flags.AttachFiles)
+        ) {
+          return {
+            ok: false,
+            error:
+              'O bot precisa das permissões Ver Canal, Enviar Mensagens e Anexar Arquivos neste canal.',
+          };
+        }
+      }
+
+      const pngBuffer = await renderWelcomeBanner({
+        title: options.title,
+        message: options.message,
+        memberDisplayName: options.memberDisplayName,
+        memberUsername: options.memberUsername,
+        guildName,
+        memberCount,
+        avatarUrl: options.avatarUrl,
+        imageFilename: options.imageFilename,
+      });
+
+      const filename =
+        options.eventType === 'welcome' ? 'demonstracao-entrada.png' : 'demonstracao-saida.png';
+      await channel.send({
+        content: `<@${options.memberUserId}>`,
+        files: [new AttachmentBuilder(pngBuffer, { name: filename })],
+        allowedMentions: { users: [options.memberUserId] },
+      });
+
+      return { ok: true };
+    }
+
+    // Fallback via Discord REST API if gateway is still connecting
+    const token = process.env.DISCORD_BOT_TOKEN?.trim();
+    if (!token) {
+      return { ok: false, error: 'Token do bot não configurado no servidor.' };
+    }
+
+    const guildResp = await fetch(`https://discord.com/api/v10/guilds/${options.guildId}`, {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (guildResp.ok) {
+      const g = (await guildResp.json()) as { name?: string };
+      if (g.name) guildName = g.name;
+    }
+
+    const pngBuffer = await renderWelcomeBanner({
+      title: options.title,
+      message: options.message,
+      memberDisplayName: options.memberDisplayName,
+      memberUsername: options.memberUsername,
+      guildName,
+      memberCount,
+      avatarUrl: options.avatarUrl,
+      imageFilename: options.imageFilename,
+    });
+
+    const filename =
+      options.eventType === 'welcome' ? 'demonstracao-entrada.png' : 'demonstracao-saida.png';
+
+    const form = new FormData();
+    form.append(
+      'payload_json',
+      JSON.stringify({
+        content: `<@${options.memberUserId}>`,
+        allowed_mentions: { users: [options.memberUserId] },
+      }),
+    );
+    form.append('files[0]', new Blob([new Uint8Array(pngBuffer)], { type: 'image/png' }), filename);
+
+    const sendResp = await fetch(
+      `https://discord.com/api/v10/channels/${options.channelId}/messages`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bot ${token}` },
+        body: form,
+      },
+    );
+
+    if (!sendResp.ok) {
+      const errDetail = await sendResp.text().catch(() => '');
+      return {
+        ok: false,
+        error: `O Discord recusou o envio no canal (HTTP ${sendResp.status}). Verifique as permissões do bot no canal selecionado. ${errDetail}`.trim(),
+      };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: formatApiError(err),
+    };
+  }
+}
+
+export function getBotClient(): Client | null {
+  return discordClient;
+}
+
+export function isBotOnline(): boolean {
+  return botReady && Boolean(discordClient?.isReady());
+}
+
+export async function initDiscordGatewayBot(): Promise<Client | null> {
+  if (!discordClient || !discordClient.isReady()) {
+    await initializeDiscordBot().catch(() => {});
+  }
+  return discordClient;
+}
+
+

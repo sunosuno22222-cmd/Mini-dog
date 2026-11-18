@@ -10,22 +10,33 @@ import {
   Guild,
   GuildMember,
   Message,
+  ModalBuilder,
+  ModalSubmitInteraction,
   OverwriteResolvable,
   PermissionFlagsBits,
   TextChannel,
+  TextInputBuilder,
+  TextInputStyle,
   VoiceBasedChannel,
   VoiceState,
 } from "discord.js";
 import { getBotClient } from "./bot";
 import { hydrateAiVoiceFromDisk } from "./aiVoice";
-import { joinVoiceCall, leaveVoiceCall, speakInVoiceCall, waitForVoiceQueueIdle, VoiceSpeechMeta } from "./voice";
-import { emitCallGameBroadcastEvent } from "./broadcastHub";
 import {
-  startInternalStageBroadcast,
-  retargetServerScreenBroadcast,
-  stopServerScreenBroadcast,
-  isServerStageBroadcastActive,
-} from "./serverScreen";
+  joinVoiceCall,
+  leaveVoiceCall,
+  speakInVoiceCall,
+  waitForVoiceQueueIdle,
+  synthesizeSpeechAudio,
+  queuePreloadedAudioBuffersInVoiceCall,
+} from "./voice";
+import {
+  ensureGameStickersReady,
+  ensureUserAvatarSticker,
+  getCachedUserAvatarSticker,
+  getStickerTag,
+  formatFichaRecord,
+} from "./stickers";
 
 export const DEFAULT_GAME_OWNER_ID = "1554257592015003674";
 
@@ -95,22 +106,25 @@ export const DEFAULT_CRIMINAL_QUESTIONS: string[] = [
 export const DEFAULT_QUESTIONS_PER_MATCH = 4;
 
 export const DEFAULT_RULES =
-  "1. Entre na call normal e aguarde o dono iniciar tudo.\n2. Ao começar, todos serão movidos para a call principal privada.\n3. Responda cada pergunta apenas no seu canal privado!";
+  "1. Entre na call normal e clique em **Pronto** para fazer seu registro.\n2. Todos os participantes (incluindo o dono) precisam confirmar que estão prontos.\n3. Quando todos estiverem prontos, o dono clica em **Começar** e cada jogador responde na caixa de texto!";
 
 export type CallGamePhase = "idle" | "lobby" | "starting" | "playing" | "finished";
 
 export interface CallGameReadyPlayer {
   userId: string;
   username: string;
-  avatar?: string | null;
+  gender: "m" | "f";
+  voiceId?: string;
   readyAt: number;
 }
 
 export interface CallGameMatchPlayer {
   userId: string;
   username: string;
-  avatar?: string | null;
+  gender: "m" | "f";
+  voiceId?: string;
   privateTextChannelId: string | null;
+  questionMessageId?: string | null;
   totalPoints: number;
 }
 
@@ -152,6 +166,8 @@ export interface CallGameSession {
   privateChannelName: string | null;
   smsChannelId: string | null;
   panelMessageId: string | null;
+  allReadyMessageId?: string | null;
+  currentRoundMessageId?: string | null;
   voice: string;
   expression: string;
   rulesText: string;
@@ -163,8 +179,6 @@ export interface CallGameSession {
   currentQuestion: string | null;
   roundDeadlineAt: number | null;
   startedAt: number;
-  connectedAccount?: { userId: string; username: string; avatar?: string | null } | null;
-  autoScreenBroadcast?: boolean;
   readyPlayers: CallGameReadyPlayer[];
   matchPlayers: CallGameMatchPlayer[];
   roundResults: CallGameRoundResult[];
@@ -192,12 +206,22 @@ interface InternalRuntimeState {
 }
 
 const GAME_STATE_FILE = path.join(process.cwd(), ".call-game-state.json");
-const activeRuntimes = new Map<string, InternalRuntimeState>();
-const recentJoinDebounce = new Map<string, number>();
-// Temporary voice channels waiting for all humans to leave before auto-deletion
-const pendingAutoDeleteVoiceChannels = new Map<string, string>(); // channelId -> guildId
-// Tracks recently used questions per guild so consecutive games don't repeat until the pool is exhausted
-const recentQuestionsByGuild = new Map<string, Set<string>>();
+
+// Store runtime Maps on globalThis so Vite SSR reloads NEVER drop active games or player drafts
+const gStateAny = globalThis as any;
+if (!gStateAny.__callGameState) {
+  gStateAny.__callGameState = {
+    activeRuntimes: new Map<string, InternalRuntimeState>(),
+    recentJoinDebounce: new Map<string, number>(),
+    pendingAutoDeleteVoiceChannels: new Map<string, string>(),
+    recentQuestionsByGuild: new Map<string, Set<string>>(),
+    playerDrafts: new Map<string, any>(),
+  };
+}
+const activeRuntimes: Map<string, InternalRuntimeState> = gStateAny.__callGameState.activeRuntimes;
+const recentJoinDebounce: Map<string, number> = gStateAny.__callGameState.recentJoinDebounce;
+const pendingAutoDeleteVoiceChannels: Map<string, string> = gStateAny.__callGameState.pendingAutoDeleteVoiceChannels;
+const recentQuestionsByGuild: Map<string, Set<string>> = gStateAny.__callGameState.recentQuestionsByGuild;
 
 function readPersistedGameStates(): Record<string, PersistedGuildGameState> {
   try {
@@ -453,31 +477,177 @@ function sanitizeChannelSlug(name: string): string {
   return slug || "jogador";
 }
 
+export const SOLID_GREY_EMBED = 0x2b2d31;
+
+export const UNCOMMON_MALE_TIKTOK_VOICES = [
+  { id: "tiktok_contra", label: "🧔 Contra / Luiz (PT-BR Masculino)" },
+  { id: "tiktok_bueno", label: "⚽ Galvão Bueno (PT-BR Masculino)" },
+  { id: "narrator", label: "🎙️ Lucas / Narrador (PT-BR Masculino)" },
+  { id: "tiktok_bv_male", label: "🎧 Bruno (PT-BR Masculino)" },
+];
+
+export const UNCOMMON_FEMALE_TIKTOK_VOICES = [
+  { id: "tiktok_laizza", label: "👩 Laizza (PT-BR Feminino)" },
+  { id: "lhays_anime", label: "🎀 Lhays Macedo (PT-BR Feminino)" },
+  { id: "tiktok_ivete", label: "🎤 Ivete Sangalo (PT-BR Feminino)" },
+  { id: "tiktok_ludmilla", label: "🎶 Ludmilla (PT-BR Feminino)" },
+  { id: "garota_timida", label: "🌸 Júlia / Tímida (PT-BR Feminino)" },
+  { id: "tiktok_br_f1", label: "✨ Camila (PT-BR Feminino)" },
+  { id: "tiktok_br_f3", label: "💎 Ana (PT-BR Feminino)" },
+];
+
+export const OWNER_EXCLUSIVE_MALE_FUNNY_VOICES = [
+  { id: "tiktok_funny_male", label: "🤡 Zé Maluco / Esquilo (PT-BR Engraçada · Exclusiva 👑)" },
+  { id: "tiktok_funny_male_grumpy", label: "🐸 Pato / Voz Engrossada (PT-BR Engraçada · Exclusiva 👑)" },
+];
+
+export const OWNER_EXCLUSIVE_FEMALE_FUNNY_VOICES = [
+  { id: "tiktok_funny_female", label: "🤪 Paty Esquilo / Maluca (PT-BR Engraçada · Exclusiva 👑)" },
+  { id: "tiktok_funny_female_drama", label: "🎭 Tia Dramática / Doida (PT-BR Engraçada · Exclusiva 👑)" },
+];
+
+const EXCLUSIVE_VOICE_IDS = new Set<string>([
+  ...OWNER_EXCLUSIVE_MALE_FUNNY_VOICES.map((v) => v.id),
+  ...OWNER_EXCLUSIVE_FEMALE_FUNNY_VOICES.map((v) => v.id),
+]);
+
+function isGameOwner(session: CallGameSession | undefined | null, userId: string): boolean {
+  return Boolean(session && session.ownerUserId === userId);
+}
+
+function getVoicePoolForGender(gender: "m" | "f", isOwner = false) {
+  if (gender === "f") {
+    return isOwner
+      ? [...OWNER_EXCLUSIVE_FEMALE_FUNNY_VOICES, ...UNCOMMON_FEMALE_TIKTOK_VOICES]
+      : UNCOMMON_FEMALE_TIKTOK_VOICES;
+  }
+  return isOwner
+    ? [...OWNER_EXCLUSIVE_MALE_FUNNY_VOICES, ...UNCOMMON_MALE_TIKTOK_VOICES]
+    : UNCOMMON_MALE_TIKTOK_VOICES;
+}
+
+function resolvePortugueseVoiceId(voiceId: string | undefined, gender: "m" | "f", fallbackIdx = 0, isOwner = false): string {
+  const pool = getVoicePoolForGender(gender, isOwner);
+  if (voiceId && (!EXCLUSIVE_VOICE_IDS.has(voiceId) || isOwner) && pool.some((v) => v.id === voiceId)) {
+    return voiceId;
+  }
+  return pool[Math.abs(fallbackIdx) % pool.length].id;
+}
+
+function getVoiceLabel(voiceId: string, gender: "m" | "f"): string {
+  const allVoices = [
+    ...OWNER_EXCLUSIVE_MALE_FUNNY_VOICES,
+    ...OWNER_EXCLUSIVE_FEMALE_FUNNY_VOICES,
+    ...UNCOMMON_MALE_TIKTOK_VOICES,
+    ...UNCOMMON_FEMALE_TIKTOK_VOICES,
+  ];
+  const found = allVoices.find((v) => v.id === voiceId);
+  return found?.label || getVoicePoolForGender(gender, false)[0].label;
+}
+
+export interface PlayerDraftSetup {
+  customName: string;
+  gender: "m" | "f";
+  voiceId: string;
+}
+
+const playerDrafts: Map<string, PlayerDraftSetup> = gStateAny.__callGameState.playerDrafts;
+
+export function buildPlayerSetupEmbed(draft: PlayerDraftSetup, isOwner = false): EmbedBuilder {
+  const genderLabel = draft.gender === "f" ? "👩 Feminino" : "👨 Masculino";
+  const effectiveVoiceId = resolvePortugueseVoiceId(draft.voiceId, draft.gender, 0, isOwner);
+  const voiceLabel = getVoiceLabel(effectiveVoiceId, draft.gender);
+  const ownerExclusiveHint = isOwner
+    ? `\n👑 **Exclusivo de quem começa o jogo:** Você desbloqueou as **Vozes Engraçadas em Português** (masculina e feminina)!\n`
+    : "";
+  return new EmbedBuilder()
+    .setTitle("⚙️ Identificador & Perfil no Jogo")
+    .setColor(SOLID_GREY_EMBED)
+    .setDescription(
+      `Configure como você será anunciado e qual voz em português do TikTok lerá suas respostas na call:${ownerExclusiveHint}\n` +
+        `👤 **Identificador / Nome:** \`${draft.customName}\`\n` +
+        `⚧️ **Sexo:** **${genderLabel}**\n` +
+        `🎭 **Voz do TikTok (PT-BR):** **${voiceLabel}**\n\n` +
+        `• Clique em **✏️ Alterar Nome** para digitar seu identificador via formulário.\n` +
+        `• Escolha **👨 Masculino** ou **👩 Feminino** e clique em **🎭 Trocar Voz TikTok** para escolher entre as vozes em português.\n` +
+        `• Clique em **✅ Confirmar Pronto** para entrar no jogo e o narrador te anunciar na call!`
+    );
+}
+
+export function buildPlayerSetupComponents(guildId: string, draft: PlayerDraftSetup): ActionRowBuilder<ButtonBuilder>[] {
+  const rowName = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`callgame_open_name_modal:${guildId}`)
+      .setLabel("✏️ Alterar Nome")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`callgame_cycle_voice:${guildId}`)
+      .setLabel("🎭 Trocar Voz TikTok")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const rowGender = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`callgame_set_gender:m:${guildId}`)
+      .setLabel("👨 Masculino")
+      .setStyle(draft.gender === "m" ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`callgame_set_gender:f:${guildId}`)
+      .setLabel("👩 Feminino")
+      .setStyle(draft.gender === "f" ? ButtonStyle.Success : ButtonStyle.Secondary)
+  );
+
+  const rowConfirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`callgame_confirm_ready:${guildId}`)
+      .setLabel("✅ Confirmar Pronto")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return [rowName, rowGender, rowConfirm];
+}
+
 function buildLobbyEmbed(session: CallGameSession): EmbedBuilder {
+  const readyTag = getStickerTag("ready");
+  const waitTag = getStickerTag("wait");
+  const lockTag = getStickerTag("lock");
+  const ownerRegistered = session.readyPlayers.some((p) => p.userId === session.ownerUserId);
+
   const readyLines =
     session.readyPlayers.length > 0
       ? session.readyPlayers
-          .map((p, idx) => `✅ **${idx + 1}.** <@${p.userId}> (${p.username})`)
+          .map((p) => {
+            const isOwner = p.userId === session.ownerUserId;
+            const fig = getCachedUserAvatarSticker(p.userId, isOwner);
+            const vLabel = getVoiceLabel(p.voiceId || "", p.gender);
+            const roleSuffix = isOwner ? ` · ${getStickerTag("crown")} Dono` : "";
+            return formatFichaRecord(
+              fig,
+              p.username,
+              `${readyTag} Pronto (${p.gender === "f" ? "Feminino" : "Masculino"} · ${vLabel})${roleSuffix}`
+            );
+          })
           .join("\n")
-      : "_Nenhum jogador clicou em Pronto ainda._";
+      : `_${waitTag} Nenhum jogador concluiu o registro ainda._`;
 
   const statusLine =
     session.phase === "playing"
-      ? `🎙️ **Partida em andamento** na call privada <#${session.tempVoiceChannelId}> (Pergunta ${session.currentRoundIndex + 1}/${session.questions.length})`
+      ? `${getStickerTag("mic")} **Partida em andamento** na call <#${session.tempVoiceChannelId}> (Pergunta ${session.currentRoundIndex + 1}/${session.questions.length})`
       : session.phase === "starting"
-      ? "🚀 **Movendo todos para a call principal privada...**"
+      ? `🚀 **Movendo todos para a call principal privada...**`
       : session.phase === "finished"
-      ? "🏆 **Partida encerrada!** Veja o placar abaixo."
-      : `⏳ **Aguardando na call normal** (${session.voiceChannelName}) — quando quiser começar, <@${session.ownerUserId}> clica em **Começar Tudo**.`;
+      ? `${getStickerTag("trophy")} **Partida encerrada!** Veja o placar abaixo.`
+      : `${waitTag} **Aguardando registro na call** (${session.voiceChannelName}) — **todos** os participantes e o dono (<@${session.ownerUserId}>) precisam concluir o registro e marcar **Pronto**.`;
 
   return new EmbedBuilder()
-    .setTitle("🎮 Jogo da Call — Central & Regras")
-    .setColor(session.phase === "playing" ? 0x10b981 : 0xec4899)
+    .setTitle("🎮 Jogo da Call — Registro & Regras")
+    .setColor(SOLID_GREY_EMBED)
     .setDescription(
       `${statusLine}\n\n` +
         `📜 **Regras:**\n${session.rulesText}\n\n` +
-        `👥 **Jogadores Prontos (${session.readyPlayers.length}):**\n${readyLines}\n\n` +
-        `👑 **Botão exclusivo do dono:** Apenas <@${session.ownerUserId}> pode clicar em **Começar Tudo** para puxar todos para a call principal privada.`
+        `👥 **Fichas Registradas (${session.readyPlayers.length}):**\n${readyLines}\n\n` +
+        `👑 **Status do Dono (<@${session.ownerUserId}>):** ${ownerRegistered ? `${readyTag} Registrado e pronto` : `${waitTag} Ainda não registrado`}\n` +
+        `${lockTag} **Canal compartilhado:** Apenas o bot envia mensagens aqui. Clique em **Pronto** abaixo para se registrar!`
     )
     .setFooter({ text: `Perguntas configuradas: ${session.questions.length} • Tempo/rodada: ${session.roundSeconds}s` })
     .setTimestamp();
@@ -488,27 +658,128 @@ function buildLobbyComponents(session: CallGameSession): ActionRowBuilder<Button
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`callgame_ready:${session.guildId}`)
-      .setLabel("Estou Pronto")
+      .setLabel("Pronto")
       .setEmoji("✅")
       .setStyle(ButtonStyle.Success)
-      .setDisabled(isPlaying),
-    new ButtonBuilder()
-      .setCustomId(`callgame_owner_start:${session.guildId}`)
-      .setLabel("Começar Tudo (Só Dono)")
-      .setEmoji("👑")
-      .setStyle(ButtonStyle.Primary)
       .setDisabled(isPlaying)
   );
 }
 
-function buildOwnerPrivateControlRow(guildId: string): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`callgame_owner_start:${guildId}`)
-      .setLabel("Começar Tudo (Botão Privado do Dono)")
-      .setEmoji("🚀")
-      .setStyle(ButtonStyle.Danger)
-  );
+async function getLobbyReadinessStatus(guild: Guild, session: CallGameSession): Promise<{
+  allReady: boolean;
+  ownerReady: boolean;
+  humansInVoice: GuildMember[];
+  missingMembers: GuildMember[];
+}> {
+  const readyIds = new Set(session.readyPlayers.map((p) => p.userId));
+  const ownerReady = readyIds.has(session.ownerUserId);
+
+  const lobbyVoice = (guild.channels.cache.get(session.voiceChannelId) ||
+    (await guild.channels.fetch(session.voiceChannelId).catch(() => null))) as VoiceBasedChannel | null;
+
+  const humansInVoice: GuildMember[] = lobbyVoice && lobbyVoice.isVoiceBased()
+    ? Array.from(lobbyVoice.members.values()).filter((m) => !m.user.bot)
+    : [];
+
+  const missingMembers = humansInVoice.filter((m) => !readyIds.has(m.id));
+  const allReady = humansInVoice.length > 0 && ownerReady && missingMembers.length === 0;
+
+  return { allReady, ownerReady, humansInVoice, missingMembers };
+}
+
+async function checkAndNotifyAllPlayersReady(guild: Guild, session: CallGameSession): Promise<void> {
+  if (session.phase !== "lobby" || !session.privateChannelId) return;
+
+  const chan = (guild.channels.cache.get(session.privateChannelId) ||
+    (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null;
+  if (!chan) return;
+
+  const { allReady, ownerReady, humansInVoice, missingMembers } = await getLobbyReadinessStatus(guild, session);
+  const lockTag = getStickerTag("lock");
+  const readyTag = getStickerTag("ready");
+  const waitTag = getStickerTag("wait");
+
+  if (allReady) {
+    const fichas = session.readyPlayers
+      .map((p) =>
+        formatFichaRecord(
+          getCachedUserAvatarSticker(p.userId, p.userId === session.ownerUserId),
+          p.username,
+          `${readyTag} Pronto`
+        )
+      )
+      .join("\n");
+
+    const warningContent = `${lockTag} **AVISO:** Somente o dono (<@${session.ownerUserId}>) pode iniciar a partida!`;
+    const readyEmbed = new EmbedBuilder()
+      .setTitle(`${readyTag} Tudo preparado!`)
+      .setColor(SOLID_GREY_EMBED)
+      .setDescription(
+        `Todos os **${humansInVoice.length}** participante(s) (incluindo o dono) concluíram o registro e confirmaram que estão prontos.\n\n` +
+          `${fichas}\n\n` +
+          `Clique em **Começar** abaixo para iniciar a partida no canal compartilhado.`
+      )
+      .setTimestamp();
+
+    const startRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`callgame_owner_start:${session.guildId}`)
+        .setLabel("Começar")
+        .setEmoji("🚀")
+        .setStyle(ButtonStyle.Success)
+    );
+
+    if (session.allReadyMessageId) {
+      const existingMsg = await chan.messages.fetch(session.allReadyMessageId).catch(() => null);
+      if (existingMsg) {
+        await existingMsg.edit({ content: warningContent, embeds: [readyEmbed], components: [startRow] }).catch(() => {});
+        return;
+      }
+    }
+
+    const sent = await chan.send({
+      content: warningContent,
+      embeds: [readyEmbed],
+      components: [startRow],
+    }).catch(() => null);
+    if (sent) {
+      session.allReadyMessageId = sent.id;
+      addGameEvent(session, "Todos os participantes + dono estão prontos! Botão 'Começar' liberado.");
+    }
+  } else if (session.allReadyMessageId) {
+    // Someone new joined or hasn't registered yet: update the readiness message so Começar stays locked
+    const existingMsg = await chan.messages.fetch(session.allReadyMessageId).catch(() => null);
+    if (existingMsg) {
+      const missingText = [
+        !ownerReady ? `<@${session.ownerUserId}> (Dono)` : null,
+        ...missingMembers.filter((m) => m.id !== session.ownerUserId).map((m) => `<@${m.id}>`),
+      ]
+        .filter(Boolean)
+        .join(", ");
+
+      const pendingEmbed = new EmbedBuilder()
+        .setTitle(`${waitTag} Aguardando conclusão de registro...`)
+        .setColor(SOLID_GREY_EMBED)
+        .setDescription(
+          `A partida só poderá começar quando **todos** os participantes e o dono concluírem o registro e clicarem em **Pronto**.\n\n` +
+            `📌 **Faltam registrar:** ${missingText || "Nenhum participante na call"}`
+        );
+
+      const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`callgame_owner_start:${session.guildId}`)
+          .setLabel("Começar")
+          .setEmoji("🚀")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true)
+      );
+      await existingMsg.edit({
+        content: `${lockTag} **AVISO:** Somente o dono (<@${session.ownerUserId}>) pode iniciar a partida!`,
+        embeds: [pendingEmbed],
+        components: [disabledRow],
+      }).catch(() => {});
+    }
+  }
 }
 
 async function ensureLobbyGameChannel(
@@ -532,7 +803,10 @@ async function ensureLobbyGameChannel(
         await existing.permissionOverwrites
           .edit(uid, {
             ViewChannel: true,
-            SendMessages: true,
+            SendMessages: false,
+            SendMessagesInThreads: false,
+            CreatePublicThreads: false,
+            CreatePrivateThreads: false,
             ReadMessageHistory: true,
           })
           .catch(() => {});
@@ -554,7 +828,13 @@ async function ensureLobbyGameChannel(
   const overwrites: OverwriteResolvable[] = [
     {
       id: guild.roles.everyone.id,
-      deny: [PermissionFlagsBits.ViewChannel],
+      deny: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
+      ],
     },
   ];
 
@@ -578,8 +858,13 @@ async function ensureLobbyGameChannel(
       id: uid,
       allow: [
         PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
       ],
     });
   }
@@ -588,7 +873,7 @@ async function ensureLobbyGameChannel(
     name: "🔒・jogo-da-call",
     type: ChannelType.GuildText,
     parent: voiceChannel?.parentId || undefined,
-    topic: `Canal do Jogo da Call (${session.voiceChannelName})`,
+    topic: `Canal do Jogo da Call (${session.voiceChannelName}) — Apenas o bot pode enviar mensagens`,
     permissionOverwrites: overwrites,
   });
 
@@ -596,14 +881,14 @@ async function ensureLobbyGameChannel(
   session.privateChannelName = created.name;
 
   const sent = await created.send({
-    content: `👑 <@${session.ownerUserId}> — Este é o canal do jogo. Use o botão privado de dono abaixo quando quiser **Começar Tudo**!`,
+    content: `🎮 <@${session.ownerUserId}> — Canal do jogo criado! Todos os participantes (incluindo o dono) devem clicar em **Pronto** para se registrar.`,
     embeds: [buildLobbyEmbed(session)],
     components: [buildLobbyComponents(session)],
   });
   session.panelMessageId = sent.id;
   syncPersistedGameState(session);
 
-  addGameEvent(session, `Canal do jogo #${created.name} criado com o botão exclusivo do dono.`);
+  addGameEvent(session, `Canal do jogo #${created.name} criado (sem permissão de envio para membros).`);
   return created;
 }
 
@@ -660,13 +945,9 @@ function scheduleLobbyWelcomeSpeech(session: CallGameSession, triggerLabel: stri
         runtime.session.guildId,
         msg,
         runtime.session.voiceChannelId,
-        runtime.session.voice,
+        "narrator",
         undefined,
-        runtime.session.expression,
-        {
-          kind: "lobby_speech",
-          displayText: "Bem-vindo!\nSiga as regras no canal privado criado.\nPara começar, aperte no botão Pronto!",
-        }
+        runtime.session.expression
       );
       addGameEvent(runtime.session, `Boas-vindas falada na call (${triggerLabel}).`);
     } catch (err) {
@@ -861,41 +1142,105 @@ async function evaluateAnswersWithAI(
   };
 }
 
+function buildSharedRoundEmbed(
+  session: CallGameSession,
+  runtime: InternalRuntimeState,
+  roundIndex: number,
+  closed = false
+): EmbedBuilder {
+  const question = session.questions[roundIndex] || session.currentQuestion || "Pergunta";
+  const replyTag = getStickerTag("reply");
+  const waitTag = getStickerTag("wait");
+
+  const statusLines = session.matchPlayers
+    .map((mp) => {
+      const fig = getCachedUserAvatarSticker(mp.userId, mp.userId === session.ownerUserId);
+      const answered = runtime.currentAnswers.has(mp.userId);
+      const badge = answered
+        ? `${replyTag} Respondido`
+        : closed
+        ? "✖️ Sem resposta"
+        : `${waitTag} Aguardando resposta`;
+      return formatFichaRecord(fig, mp.username, badge);
+    })
+    .join("\n");
+
+  return new EmbedBuilder()
+    .setTitle(`⚖️ Pergunta ${roundIndex + 1} de ${session.questions.length}`)
+    .setColor(SOLID_GREY_EMBED)
+    .setDescription(
+      `**${question}**\n\n` +
+        (closed
+          ? `🔒 **Tempo encerrado!** Ouvindo as respostas na call...\n\n`
+          : `✍️ Clique em **Responder** abaixo para abrir a caixa de texto e enviar sua resposta diretamente!\n⏱️ Tempo limite: **${session.roundSeconds} segundos**\n\n`) +
+        `**Fichas da Rodada (${runtime.currentAnswers.size}/${session.matchPlayers.length}):**\n${statusLines}`
+    )
+    .setTimestamp();
+}
+
+function buildRoundAnswerButtonRow(guildId: string, roundIndex: number, disabled = false): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`callgame_open_answer_modal:${guildId}:${roundIndex}`)
+      .setLabel(disabled ? "Respostas Encerradas" : "✍️ Responder")
+      .setStyle(disabled ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      .setDisabled(disabled)
+  );
+}
+
+async function refreshSharedRoundMessage(guild: Guild, runtime: InternalRuntimeState, roundIndex: number, closed = false): Promise<void> {
+  const { session } = runtime;
+  if (!session.privateChannelId || !session.currentRoundMessageId) return;
+  const mainTextChan = (guild.channels.cache.get(session.privateChannelId) ||
+    (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null;
+  if (!mainTextChan) return;
+  const msg = await mainTextChan.messages.fetch(session.currentRoundMessageId).catch(() => null);
+  if (!msg) return;
+  await msg.edit({
+    embeds: [buildSharedRoundEmbed(session, runtime, roundIndex, closed)],
+    components: [buildRoundAnswerButtonRow(session.guildId, roundIndex, closed)],
+  }).catch(() => {});
+}
+
 async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promise<void> {
   const { session } = runtime;
   const targetVoiceId = session.tempVoiceChannelId || session.voiceChannelId;
 
-  const speakAndLog = async (text: string, meta?: VoiceSpeechMeta) => {
+  const speakAndLog = async (text: string, voice = "narrator") => {
     if (runtime.aborted) return;
     await speakInVoiceCall(
       session.guildId,
       text,
       targetVoiceId,
-      session.voice,
+      voice,
       undefined,
-      session.expression,
-      meta
+      session.expression
     );
   };
 
   try {
-    // 1. Wait 3 seconds after moving everyone to the temporary private voice channel
+    // 1. Wait 3 seconds after moving everyone to the temporary private voice channel (only startup delay)
     await new Promise((r) => setTimeout(r, 3000));
     if (runtime.aborted) return;
 
+    const participantNames = session.matchPlayers.length > 0
+      ? session.matchPlayers.map((p) => sanitizeForSpeech(p.username, 40)).join(", ")
+      : "todos vocês";
+
     await speakAndLog(
-      "Olá a todos, o jogo foi iniciado! Regras: quando o bot fazer alguma pergunta, responda ela no seu canal criado privado.",
-      {
-        kind: "announcement",
-        displayText:
-          "Olá a todos, o jogo foi iniciado!\nQuando o bot fizer alguma pergunta, responda ela no seu canal privado.",
-      }
+      `Olá a todos, o jogo foi iniciado! Regras: quando aparecer uma pergunta no canal compartilhado, cliquem em responder e escrevam direto na caixa de texto. Os participantes de hoje são: ${participantNames}. Boa sorte a todos!`,
+      "narrator"
     );
-    addGameEvent(session, "Bot falou a introdução do jogo após 3 segundos na call privada.");
+    addGameEvent(session, "Narrador iniciou o jogo na call privada anunciando os participantes.");
     await waitForVoiceQueueIdle(session.guildId, 45_000);
     if (runtime.aborted) return;
 
-    // 2. Execute each question round sequentially
+    const mainTextChan = session.privateChannelId
+      ? ((guild.channels.cache.get(session.privateChannelId) ||
+          (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null)
+      : null;
+
+    // 2. Execute each question round sequentially in the shared channel
     for (let rIdx = 0; rIdx < session.questions.length; rIdx++) {
       if (runtime.aborted) return;
 
@@ -903,54 +1248,31 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
       session.currentRoundIndex = rIdx;
       session.currentQuestion = question;
       session.roundDeadlineAt = Date.now() + session.roundSeconds * 1000;
+      session.currentRoundMessageId = null;
       runtime.currentAnswers.clear();
       runtime.roundActive = true;
-
-      emitCallGameBroadcastEvent({
-        type: "round_question",
-        guildId: session.guildId,
-        questionNumber: rIdx + 1,
-        totalQuestions: session.questions.length,
-        question,
-        deadlineAt: session.roundDeadlineAt,
-      });
 
       addGameEvent(session, `Pergunta ${rIdx + 1}/${session.questions.length}: "${question}"`);
       await updateLobbyPanelMessage(guild, session);
 
-      // Post question inside every player's private text channel
-      for (const mp of session.matchPlayers) {
-        if (!mp.privateTextChannelId) continue;
-        const pChan = (guild.channels.cache.get(mp.privateTextChannelId) ||
-          (await guild.channels.fetch(mp.privateTextChannelId).catch(() => null))) as TextChannel | null;
-        if (!pChan) continue;
-
-        await purgeAllMessagesInChannel(pChan);
-        const qEmbed = new EmbedBuilder()
-          .setTitle(`⚖️ Pergunta ${rIdx + 1} de ${session.questions.length}`)
-          .setColor(0xf43f5e)
-          .setDescription(
-            `**${question}**\n\n` +
-              `📩 **Envie UMA mensagem neste canal respondendo!**\n` +
-              `⏱️ Tempo limite: **${session.roundSeconds} segundos**.\n` +
-              `_Assim que você responder, o bot dirá OK, guardará sua resposta e apagará as mensagens aqui._`
-          )
-          .setTimestamp();
-
-        await pChan.send({ content: `<@${mp.userId}>`, embeds: [qEmbed] }).catch(() => {});
+      // Post shared round card with ONE single button that opens the direct text box (Modal)
+      if (mainTextChan) {
+        const sentRound = await mainTextChan
+          .send({
+            content: session.matchPlayers.map((mp) => `<@${mp.userId}>`).join(" "),
+            embeds: [buildSharedRoundEmbed(session, runtime, rIdx, false)],
+            components: [buildRoundAnswerButtonRow(session.guildId, rIdx, false)],
+          })
+          .catch(() => null);
+        if (sentRound) {
+          session.currentRoundMessageId = sentRound.id;
+        }
       }
 
-      // Speak question in voice call
+      // Speak question in voice call immediately with narrator voice
       await speakAndLog(
-        `Pergunta número ${rIdx + 1}: ${sanitizeForSpeech(question, 220)}. Respondam no canal privado de vocês!`,
-        {
-          kind: "question",
-          roundIndex: rIdx,
-          questionNumber: rIdx + 1,
-          totalQuestions: session.questions.length,
-          question,
-          displayText: question,
-        }
+        `Pergunta número ${rIdx + 1}: ${sanitizeForSpeech(question, 220)}. Cliquem em responder e escrevam na caixa de texto!`,
+        "narrator"
       );
 
       // Wait until all match players answer OR round timer expires
@@ -969,60 +1291,20 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
       runtime.roundActive = false;
       session.roundDeadlineAt = null;
 
+      await refreshSharedRoundMessage(guild, runtime, rIdx, true);
+
       if (runtime.aborted) return;
 
       addGameEvent(
         session,
-        `Rodada ${rIdx + 1} encerrada (${runtime.currentAnswers.size}/${session.matchPlayers.length} respostas). Lendo respostas e analisando com IA...`
+        `Rodada ${rIdx + 1} encerrada (${runtime.currentAnswers.size}/${session.matchPlayers.length} respostas). Pré-carregando vozes e apurando com IA...`
       );
 
       // Wait any quick "OK" audio still playing before reading all answers
       await waitForVoiceQueueIdle(session.guildId, 25_000);
       if (runtime.aborted) return;
 
-      // Clean all players' private channels in case someone didn't answer before timeout
-      for (const mp of session.matchPlayers) {
-        if (!mp.privateTextChannelId) continue;
-        const pChan = (guild.channels.cache.get(mp.privateTextChannelId) ||
-          (await guild.channels.fetch(mp.privateTextChannelId).catch(() => null))) as TextChannel | null;
-        if (pChan) await purgeAllMessagesInChannel(pChan);
-      }
-
-      // 3. Read EVERY player's answer out loud when the round finishes
-      await speakAndLog(`Tempo encerrado! Vamos ouvir as respostas da pergunta ${rIdx + 1}.`, {
-        kind: "announcement",
-        displayText: `Tempo encerrado!\nVamos ouvir as respostas da Pergunta ${String(rIdx + 1).padStart(2, "0")}.`,
-      });
-      for (const mp of session.matchPlayers) {
-        if (runtime.aborted) return;
-        const spokenName = sanitizeForSpeech(mp.username, 60);
-        const ans = runtime.currentAnswers.get(mp.userId);
-        if (ans) {
-          await speakAndLog(`A resposta de ${spokenName} foi: ${sanitizeForSpeech(ans.answer, 210)}.`, {
-            kind: "answer_reveal",
-            roundIndex: rIdx,
-            questionNumber: rIdx + 1,
-            userId: mp.userId,
-            username: mp.username,
-            avatar: mp.avatar || null,
-            answer: ans.answer,
-            didAnswer: true,
-          });
-        } else {
-          await speakAndLog(`${spokenName} não enviou resposta a tempo.`, {
-            kind: "answer_reveal",
-            roundIndex: rIdx,
-            questionNumber: rIdx + 1,
-            userId: mp.userId,
-            username: mp.username,
-            avatar: mp.avatar || null,
-            answer: "(Não enviou resposta dentro do tempo limite)",
-            didAnswer: false,
-          });
-        }
-      }
-
-      // 4. AI judges which answer came closest / smartest
+      // 3. AI judges which answer came closest / smartest
       const judged = await evaluateAnswersWithAI(question, session.matchPlayers, runtime.currentAnswers);
       if (runtime.aborted) return;
 
@@ -1043,74 +1325,109 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
         answers: judged.scoredAnswers,
       });
 
-      const roundWinnerPlayer = session.matchPlayers.find((m) => m.userId === judged.winnerUserId);
-      emitCallGameBroadcastEvent({
-        type: "round_scored",
-        guildId: session.guildId,
-        roundNumber: rIdx + 1,
-        scores: session.matchPlayers.map((mp) => {
-          const rSc = judged.scoredAnswers.find((s) => s.userId === mp.userId);
-          return {
-            userId: mp.userId,
-            username: mp.username,
-            avatar: mp.avatar || null,
-            totalPoints: mp.totalPoints,
-            roundPoints: rSc?.points || 0,
-          };
-        }),
-        winner: judged.winnerUserId
-          ? {
-              userId: judged.winnerUserId,
-              username: judged.winnerUsername,
-              avatar: roundWinnerPlayer?.avatar || null,
-              totalPoints: roundWinnerPlayer?.totalPoints || 0,
-              winningAnswer: judged.winnerAnswer,
-              explanation: judged.explanation,
-            }
-          : null,
+      // 4. Pre-load ALL voice clips into memory buffers before playback begins
+      // 100% TikTok uncommon voices (no Google TTS!): Narrator (br_005) + distinct uncommon voices per player
+      interface SpeechJob {
+        text: string;
+        voice: string;
+      }
+      const jobs: SpeechJob[] = [];
+
+      jobs.push({
+        text: `Tempo encerrado! Vamos ouvir as respostas da pergunta ${rIdx + 1}.`,
+        voice: "narrator",
       });
 
-      // 5. Speak AI winner + answer + why ("ai que legal...")
+      for (let pIdx = 0; pIdx < session.matchPlayers.length; pIdx++) {
+        const mp = session.matchPlayers[pIdx];
+        const spokenName = sanitizeForSpeech(mp.username, 50);
+        const ans = runtime.currentAnswers.get(mp.userId);
+        if (ans) {
+          const isFemale = mp.gender === "f";
+          const introSpeech = isFemale ? "A resposta dela é:" : "A resposta dele é:";
+          const quoteVoice = resolvePortugueseVoiceId(
+            mp.voiceId,
+            isFemale ? "f" : "m",
+            pIdx,
+            mp.userId === session.ownerUserId
+          );
+          const quoteSpeech = sanitizeForSpeech(ans.answer, 210);
+
+          jobs.push({ text: introSpeech, voice: "narrator" });
+          jobs.push({ text: quoteSpeech, voice: quoteVoice });
+        } else {
+          jobs.push({
+            text: `${spokenName} não enviou resposta a tempo.`,
+            voice: "narrator",
+          });
+        }
+      }
+
       if (judged.winnerUsername && judged.winnerAnswer) {
-        const wName = sanitizeForSpeech(judged.winnerUsername, 60);
+        const wName = sanitizeForSpeech(judged.winnerUsername, 50);
         const wAns = sanitizeForSpeech(judged.winnerAnswer, 180);
-        await speakAndLog(
-          `Ai que legal! A pessoa que mais chegou perto foi ${wName}, com a resposta: ${wAns}. E o porquê é: ${judged.explanation}`,
-          {
-            kind: "round_winner",
-            questionNumber: rIdx + 1,
-            userId: judged.winnerUserId || undefined,
-            username: judged.winnerUsername,
-            avatar: roundWinnerPlayer?.avatar || null,
-            totalPoints: roundWinnerPlayer?.totalPoints || 0,
-            winningAnswer: judged.winnerAnswer,
-            explanation: judged.explanation,
-          }
-        );
+        jobs.push({
+          text: `Ai que legal! A pessoa que mais chegou perto foi ${wName}, com a resposta: ${wAns}. E o porquê é: ${judged.explanation}`,
+          voice: "narrator",
+        });
         addGameEvent(session, `🏆 Rodada ${rIdx + 1}: ${judged.winnerUsername} venceu — ${judged.explanation}`);
       } else {
-        await speakAndLog("Ninguém respondeu essa rodada, então ninguém pontuou!", {
-          kind: "announcement",
-          displayText: "Ninguém respondeu esta rodada.",
+        jobs.push({
+          text: "Ninguém respondeu essa rodada, então ninguém pontuou!",
+          voice: "narrator",
         });
       }
 
-      // Post round summary in #🔒・jogo-da-call
+      // Synthesize all audio buffers in throttled batches of 2 so TikTok TTS never throttles or times out
+      const preloadedBuffers: Buffer[] = [];
+      for (let j = 0; j < jobs.length; j += 2) {
+        const batch = jobs.slice(j, j + 2);
+        const batchRes = await Promise.all(
+          batch.map(async (job) => {
+            try {
+              const res = await synthesizeSpeechAudio(job.text, job.voice);
+              return res.mp3Buffer;
+            } catch (err) {
+              console.warn(`[CallGame Preload Error (${job.voice})]:`, (err as Error).message);
+              const fallback = await synthesizeSpeechAudio(job.text, "narrator");
+              return fallback.mp3Buffer;
+            }
+          })
+        );
+        preloadedBuffers.push(...batchRes);
+      }
+
+      // Queue all pre-synthesized buffers into the voice call
+      await queuePreloadedAudioBuffersInVoiceCall(session.guildId, preloadedBuffers, targetVoiceId);
+
+      // STRICT USER REQUIREMENT: Await until voice playback has COMPLETELY finished before sending embed!
+      await waitForVoiceQueueIdle(session.guildId, 140_000);
+      if (runtime.aborted) return;
+
+      // Post round summary embed in solid grey ONLY AFTER speech is finished
       if (session.privateChannelId) {
         const mainTextChan = (guild.channels.cache.get(session.privateChannelId) ||
           (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null;
         if (mainTextChan) {
+          const trophyTag = getStickerTag("trophy");
           const lines = judged.scoredAnswers
-            .map((a) => `• **${a.username}** (${a.points} pts): _"${a.answer}"_`)
+            .map((a) => {
+              const fig = getCachedUserAvatarSticker(a.userId, a.userId === session.ownerUserId);
+              return formatFichaRecord(fig, a.username, `**${a.points} pts** — _"${a.answer}"_`);
+            })
             .join("\n");
           const roundEmbed = new EmbedBuilder()
             .setTitle(`📊 Resultado da Pergunta ${rIdx + 1}`)
-            .setColor(0x10b981)
+            .setColor(SOLID_GREY_EMBED)
             .setDescription(
               `**Pergunta:** ${question}\n\n` +
                 `**Respostas:**\n${lines}\n\n` +
                 (judged.winnerUsername
-                  ? `🏆 **Quem mais chegou perto:** <@${judged.winnerUserId}> (${judged.winnerUsername})\n💬 **Por quê:** ${judged.explanation}`
+                  ? `${trophyTag} **Mais próximo:** ${formatFichaRecord(
+                      getCachedUserAvatarSticker(judged.winnerUserId || "", judged.winnerUserId === session.ownerUserId),
+                      judged.winnerUsername,
+                      judged.explanation
+                    )}`
                   : "⚠️ Ninguém respondeu esta rodada.")
             )
             .setTimestamp();
@@ -1118,15 +1435,12 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
         }
       }
 
-      await waitForVoiceQueueIdle(session.guildId, 90_000);
-      if (runtime.aborted) return;
-
       if (rIdx < session.questions.length - 1) {
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, 1200));
       }
     }
 
-    // 6. Final Podium & Total Points Sum
+    // 5. Final Podium & Total Points Sum
     session.phase = "finished";
     session.currentQuestion = null;
     session.roundDeadlineAt = null;
@@ -1135,102 +1449,42 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
     const ranking = [...session.matchPlayers].sort((a, b) => b.totalPoints - a.totalPoints);
     const champion = ranking[0];
 
-    const broadcastLeaderboard = ranking.map((p, idx) => ({
-      rank: idx + 1,
-      userId: p.userId,
-      username: p.username,
-      avatar: p.avatar || null,
-      totalPoints: p.totalPoints,
-      lastRoundPoints: 0,
-    }));
-
-    emitCallGameBroadcastEvent({
-      type: "match_ranking",
-      guildId: session.guildId,
-      leaderboard: broadcastLeaderboard,
-    });
-
-    await speakAndLog("Confira agora a classificação final da partida!", {
-      kind: "leaderboard",
-      displayText: "Classificação Final da Partida",
-    });
-    await waitForVoiceQueueIdle(session.guildId, 25_000);
-    if (runtime.aborted) return;
-
     if (champion && champion.totalPoints > 0) {
-      // Find champion's best scored answer across rounds for the winner spotlight
-      let bestAns: { points: number; answer: string; explanation: string } | null = null;
-      for (const rr of session.roundResults) {
-        const entry = rr.answers.find((a) => a.userId === champion.userId);
-        if (entry && (!bestAns || entry.points > bestAns.points)) {
-          bestAns = {
-            points: entry.points,
-            answer: entry.answer,
-            explanation:
-              rr.winnerUserId === champion.userId ? rr.explanation : entry.aiComment,
-          };
-        }
-      }
-
       const champSpoken = sanitizeForSpeech(champion.username, 60);
       await speakAndLog(
         `Fim de jogo! Somando os pontos de todas as perguntas, quem ganhou foi ${champSpoken} com ${champion.totalPoints} pontos! Parabéns!`,
-        {
-          kind: "final_winner",
-          userId: champion.userId,
-          username: champion.username,
-          avatar: champion.avatar || null,
-          totalPoints: champion.totalPoints,
-          winningAnswer: bestAns?.answer || null,
-          explanation:
-            bestAns?.explanation ||
-            `Maior pontuação acumulada nas ${session.questions.length} rodadas da partida.`,
-        }
+        "narrator"
       );
-      emitCallGameBroadcastEvent({
-        type: "match_finished",
-        guildId: session.guildId,
-        leaderboard: broadcastLeaderboard,
-        champion: {
-          userId: champion.userId,
-          username: champion.username,
-          avatar: champion.avatar || null,
-          totalPoints: champion.totalPoints,
-          winningAnswer: bestAns?.answer || null,
-          explanation:
-            bestAns?.explanation ||
-            `Maior pontuação acumulada nas ${session.questions.length} rodadas da partida.`,
-        },
-      });
       addGameEvent(session, `👑 CAMPEÃO FINAL: ${champion.username} com ${champion.totalPoints} pontos!`);
     } else {
-      await speakAndLog("Fim de jogo! Ninguém acumulou pontos nesta partida.", {
-        kind: "announcement",
-        displayText: "Fim de jogo!\nNinguém acumulou pontos nesta partida.",
-      });
-      emitCallGameBroadcastEvent({
-        type: "match_finished",
-        guildId: session.guildId,
-        leaderboard: broadcastLeaderboard,
-        champion: null,
-      });
+      await speakAndLog("Fim de jogo! Ninguém acumulou pontos nesta partida.", "narrator");
       addGameEvent(session, "Partida finalizada sem pontuação.");
     }
+
+    // STRICT USER REQUIREMENT: Await until winner announcement speech finishes before sending podium embed!
+    await waitForVoiceQueueIdle(session.guildId, 60_000);
+    if (runtime.aborted) return;
 
     if (session.privateChannelId) {
       const mainTextChan = (guild.channels.cache.get(session.privateChannelId) ||
         (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null;
       if (mainTextChan) {
+        const crownTag = getStickerTag("crown");
+        const trophyTag = getStickerTag("trophy");
         const podiumLines =
           ranking.length > 0
             ? ranking
-                .map((p, i) => `${i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : "▪️"} **${i + 1}º ${p.username}** — **${p.totalPoints} pontos**`)
+                .map((p, i) => {
+                  const placePrefix = i === 0 ? crownTag : i === 1 ? "🥈" : i === 2 ? "🥉" : "▪️";
+                  const fig = getCachedUserAvatarSticker(p.userId, p.userId === session.ownerUserId);
+                  return `${placePrefix} ${i + 1}º · ${formatFichaRecord(fig, p.username, `**${p.totalPoints} pontos**`)}`;
+                })
                 .join("\n")
             : "_Sem jogadores._";
 
         const finalEmbed = new EmbedBuilder()
-          .setTitle("🏆 Jogo da Call — Resultado Final!")
-          .setColor(0xf59e0b)
+          .setTitle(`${trophyTag} Jogo da Call — Resultado Final!`)
+          .setColor(SOLID_GREY_EMBED)
           .setDescription(
             `${podiumLines}\n\n` +
               `🤖 _O bot vai sair da call privada automaticamente agora. A call privada será excluída automaticamente assim que todo mundo sair dela!_`
@@ -1244,25 +1498,9 @@ async function runMatchLoop(guild: Guild, runtime: InternalRuntimeState): Promis
     await waitForVoiceQueueIdle(session.guildId, 90_000);
     if (runtime.aborted) return;
 
-    // 7. Delete every player's private text channel
-    for (const mp of session.matchPlayers) {
-      if (!mp.privateTextChannelId) continue;
-      const pChan =
-        guild.channels.cache.get(mp.privateTextChannelId) ||
-        (await guild.channels.fetch(mp.privateTextChannelId).catch(() => null));
-      if (pChan) {
-        await pChan.delete("Fim do Jogo da Call — limpeza de canal privado individual.").catch(() => {});
-      }
-      runtime.playerChannelToUserId.delete(mp.privateTextChannelId);
-      mp.privateTextChannelId = null;
-    }
-
-    // 8. Bot leaves the temporary voice channel automatically (does NOT force-delete while humans remain; auto-deletes when empty)
+    // 7. Bot leaves the temporary voice channel automatically (does NOT force-delete while humans remain; auto-deletes when empty)
     const tempVoiceId = session.tempVoiceChannelId;
     leaveVoiceCall(session.guildId);
-    if (isServerStageBroadcastActive()) {
-      void stopServerScreenBroadcast().catch(() => {});
-    }
     addGameEvent(session, "Bot saiu da call privada automaticamente. Aguardando todos saírem para excluir a call.");
 
     if (tempVoiceId) {
@@ -1302,7 +1540,7 @@ export function getCallGameStatus(guildId: string): CallGameSession {
     privateChannelName: null,
     smsChannelId: null,
     panelMessageId: null,
-    voice: "lhays_anime",
+    voice: "narrator",
     expression: "shy",
     rulesText: DEFAULT_RULES,
     questionPool: [...DEFAULT_CRIMINAL_QUESTIONS],
@@ -1313,8 +1551,6 @@ export function getCallGameStatus(guildId: string): CallGameSession {
     currentQuestion: null,
     roundDeadlineAt: null,
     startedAt: 0,
-    connectedAccount: null,
-    autoScreenBroadcast: true,
     readyPlayers: [],
     matchPlayers: [],
     roundResults: [],
@@ -1333,7 +1569,7 @@ export async function startCallGame(params: {
   questions?: string[];
   questionsPerMatch?: number;
   roundSeconds?: number;
-  connectedAccount?: { userId: string; username: string; avatar?: string | null } | null;
+  connectedAccount?: any;
   autoScreenBroadcast?: boolean;
 }): Promise<CallGameSession> {
   const client = getBotClient();
@@ -1357,6 +1593,7 @@ export async function startCallGame(params: {
   }
 
   const joinRes = await joinVoiceCall(params.guildId, params.voiceChannelId);
+  await ensureGameStickersReady(guild).catch(() => {});
 
   const rawPool = (params.questions && params.questions.length > 0
     ? params.questions
@@ -1384,7 +1621,9 @@ export async function startCallGame(params: {
     privateChannelName: prev?.session.privateChannelName || null,
     smsChannelId: params.smsChannelId?.trim() || prev?.session.smsChannelId || null,
     panelMessageId: prev?.session.panelMessageId || null,
-    voice: params.voice || "lhays_anime",
+    allReadyMessageId: null,
+    currentRoundMessageId: null,
+    voice: params.voice || "narrator",
     expression: params.expression || "shy",
     rulesText: params.rulesText?.trim() || DEFAULT_RULES,
     questionPool,
@@ -1395,8 +1634,6 @@ export async function startCallGame(params: {
     currentQuestion: null,
     roundDeadlineAt: null,
     startedAt: Date.now(),
-    connectedAccount: params.connectedAccount || null,
-    autoScreenBroadcast: params.autoScreenBroadcast !== false,
     readyPlayers: [],
     matchPlayers: [],
     roundResults: [],
@@ -1415,35 +1652,13 @@ export async function startCallGame(params: {
 
   activeRuntimes.set(params.guildId, runtime);
   syncPersistedGameState(session);
-  emitCallGameBroadcastEvent({
-    type: "lobby_open",
-    guildId: params.guildId,
-    guildName: guild.name,
-    voiceChannelId: params.voiceChannelId,
-    voiceChannelName: joinRes.channelName,
-  });
   addGameEvent(
     session,
-    `Bot entrou na call normal "${joinRes.channelName}". Aguardando o dono (${session.ownerUserId}) clicar em Começar Tudo.`
+    `Bot entrou na call normal "${joinRes.channelName}". Aguardando todos e o dono (${session.ownerUserId}) registrarem Pronto.`
   );
 
   await ensureLobbyGameChannel(guild, session);
   await updateLobbyPanelMessage(guild, session);
-
-  if (session.autoScreenBroadcast) {
-    addGameEvent(
-      session,
-      "🖥️ Navegador no Servidor (EUA us-east5) aberto em 'AGUARDANDO INÍCIO DA PARTIDA' — continua ativo mesmo se você sair do aplicativo!"
-    );
-    void startInternalStageBroadcast({
-      guildId: params.guildId,
-      voiceChannelId: params.voiceChannelId,
-      fallbackTextChannelId: session.privateChannelId || undefined,
-      intervalSeconds: 4,
-    }).catch((err) => {
-      console.warn("[CallGame] Erro ao iniciar navegador interno EUA:", (err as Error).message);
-    });
-  }
 
   // Wait 3s and speak welcome
   scheduleLobbyWelcomeSpeech(session, "entrada do bot na call normal");
@@ -1452,8 +1667,9 @@ export async function startCallGame(params: {
 }
 
 /**
- * Owner (or Panel) triggers "Começar Tudo":
- * Creates temporary private voice call, moves everyone + bot into it, creates 1 private text channel per player, and starts the rounds!
+ * Owner clicks "Começar":
+ * Enforces that ALL participants AND the owner have registered & marked Pronto,
+ * moves everyone into the private voice call, and runs rounds in the shared channel with direct text-box modals!
  */
 export async function beginCallGameMatch(guildId: string, requesterUserId?: string): Promise<CallGameSession> {
   const runtime = activeRuntimes.get(guildId);
@@ -1463,7 +1679,7 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
 
   const { session } = runtime;
   if (requesterUserId && requesterUserId !== session.ownerUserId) {
-    throw new Error(`Apenas o dono (${session.ownerUserId}) pode iniciar tudo!`);
+    throw new Error(`Somente o dono (<@${session.ownerUserId}>) pode iniciar a partida!`);
   }
 
   if (session.phase === "starting" || session.phase === "playing") {
@@ -1482,8 +1698,24 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
     throw new Error("Servidor não encontrado.");
   }
 
+  // STRICT REQUIREMENT: ALL participants in the call AND the owner must be registered & ready
+  const { allReady, ownerReady, humansInVoice, missingMembers } = await getLobbyReadinessStatus(guild, session);
+  if (!ownerReady) {
+    throw new Error(
+      `O dono (<@${session.ownerUserId}>) também precisa clicar em **Pronto**, concluir o registro e confirmar antes de começar!`
+    );
+  }
+  if (humansInVoice.length === 0) {
+    throw new Error("Nenhum participante encontrado na call normal para iniciar a partida.");
+  }
+  if (!allReady) {
+    const missingMentions = missingMembers.map((m) => `<@${m.id}>`).join(", ");
+    throw new Error(
+      `A partida só pode começar quando todos estiverem registrados e prontos! Faltam: ${missingMentions}`
+    );
+  }
+
   session.phase = "starting";
-  // Pick a fresh random batch of questions (default 4) from the 60+ pool for this match
   session.questions = pickRandomMatchQuestions(
     guildId,
     session.questionPool,
@@ -1491,19 +1723,34 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
   );
   addGameEvent(
     session,
-    `Dono clicou em Começar Tudo! Sorteadas ${session.questions.length} perguntas aleatórias do banco de ${session.questionPool.length}.`
+    `Dono clicou em Começar! Todos prontos (${humansInVoice.length}). Sorteadas ${session.questions.length} perguntas.`
   );
   await updateLobbyPanelMessage(guild, session);
 
-  // Gather all human members currently in the lobby call + any ready players currently in voice
+  // Disable the Começar button on the all-ready message once starting
+  if (session.privateChannelId && session.allReadyMessageId) {
+    const privChan = (guild.channels.cache.get(session.privateChannelId) ||
+      (await guild.channels.fetch(session.privateChannelId).catch(() => null))) as TextChannel | null;
+    const readyMsg = privChan ? await privChan.messages.fetch(session.allReadyMessageId).catch(() => null) : null;
+    if (readyMsg) {
+      const startedRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`callgame_owner_start:${session.guildId}`)
+          .setLabel("Partida Iniciada!")
+          .setEmoji("🚀")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true)
+      );
+      await readyMsg.edit({ components: [startedRow] }).catch(() => {});
+    }
+  }
+
   const lobbyVoice = (guild.channels.cache.get(session.voiceChannelId) ||
     (await guild.channels.fetch(session.voiceChannelId).catch(() => null))) as VoiceBasedChannel | null;
 
   const participantMap = new Map<string, GuildMember>();
-  if (lobbyVoice && lobbyVoice.isVoiceBased()) {
-    for (const [id, m] of lobbyVoice.members) {
-      if (!m.user.bot) participantMap.set(id, m);
-    }
+  for (const m of humansInVoice) {
+    participantMap.set(m.id, m);
   }
   for (const rp of session.readyPlayers) {
     if (!participantMap.has(rp.userId)) {
@@ -1514,13 +1761,13 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
     }
   }
 
-  if (participantMap.size === 0) {
-    // Include owner if they triggered from outside call so match still works cleanly
-    const ownerMember = await guild.members.fetch(session.ownerUserId).catch(() => null);
-    if (ownerMember && !ownerMember.user.bot) {
-      participantMap.set(ownerMember.id, ownerMember);
-    }
-  }
+  // Ensure transparent game stickers + every player's circular transparent avatar sticker
+  await ensureGameStickersReady(guild).catch(() => {});
+  await Promise.all(
+    Array.from(participantMap.values()).map((m) =>
+      ensureUserAvatarSticker(m.user, guild, m.id === session.ownerUserId).catch(() => "")
+    )
+  );
 
   const voiceOverwrites: OverwriteResolvable[] = [
     {
@@ -1557,7 +1804,7 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
   session.tempVoiceChannelId = tempVoice.id;
   session.tempVoiceChannelName = tempVoice.name;
 
-  // Move all participants who are in voice into the temporary private call
+  // Move all participants into the temporary private call
   for (const [, member] of participantMap) {
     if (member.voice?.channelId) {
       await member.voice.setChannel(tempVoice).catch((e) => {
@@ -1569,60 +1816,30 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
   // Move bot into the temporary private call
   await joinVoiceCall(guildId, tempVoice.id);
 
-  if (session.autoScreenBroadcast || isServerStageBroadcastActive()) {
-    void retargetServerScreenBroadcast(
-      guildId,
-      tempVoice.id,
-      session.privateChannelId || undefined
-    ).catch(() => {});
-  }
-
-  // Create 1 private text channel per participant
+  // Register match players (all share #🔒・jogo-da-call and answer via direct Modal text box!)
   session.matchPlayers = [];
   runtime.playerChannelToUserId.clear();
 
+  let playerIdx = 0;
   for (const [uid, member] of participantMap) {
-    const displayName = member.displayName || member.user.globalName || member.user.username;
-    const slug = sanitizeChannelSlug(displayName);
+    const readyInfo = session.readyPlayers.find((rp) => rp.userId === uid);
+    const chosenName = readyInfo?.username || member.displayName || member.user.globalName || member.user.username;
+    const chosenGender: "m" | "f" = readyInfo?.gender || "m";
+    const chosenVoiceId = resolvePortugueseVoiceId(
+      readyInfo?.voiceId,
+      chosenGender,
+      playerIdx,
+      uid === session.ownerUserId
+    );
+    playerIdx++;
 
-    const textChan = await guild.channels.create({
-      name: `🔒・resp-${slug}`,
-      type: ChannelType.GuildText,
-      parent: lobbyVoice?.parentId || undefined,
-      topic: `Canal privado de respostas de ${displayName} no Jogo da Call`,
-      permissionOverwrites: [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel],
-        },
-        {
-          id: botId,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ManageMessages,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
-        {
-          id: uid,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-          ],
-        },
-      ],
-    });
-
-    runtime.playerChannelToUserId.set(textChan.id, uid);
     session.matchPlayers.push({
       userId: uid,
-      username: displayName,
-      avatar: member.user.displayAvatarURL({ size: 256, extension: "png" }),
-      privateTextChannelId: textChan.id,
+      username: chosenName,
+      gender: chosenGender,
+      voiceId: chosenVoiceId,
+      privateTextChannelId: null,
+      questionMessageId: null,
       totalPoints: 0,
     });
   }
@@ -1630,21 +1847,9 @@ export async function beginCallGameMatch(guildId: string, requesterUserId?: stri
   session.phase = "playing";
   session.roundResults = [];
   syncPersistedGameState(session);
-  emitCallGameBroadcastEvent({
-    type: "match_opening",
-    guildId,
-    guildName: guild.name,
-    voiceChannelId: tempVoice.id,
-    voiceChannelName: tempVoice.name,
-    players: session.matchPlayers.map((mp) => ({
-      userId: mp.userId,
-      username: mp.username,
-      avatar: mp.avatar || null,
-    })),
-  });
   addGameEvent(
     session,
-    `Todos movidos para "${tempVoice.name}"! ${session.matchPlayers.length} canal(is) privado(s) individual(is) criados.`
+    `Partida iniciada em "${tempVoice.name}" com ${session.matchPlayers.length} jogador(es) no canal compartilhado.`
   );
   await updateLobbyPanelMessage(guild, session);
 
@@ -1716,13 +1921,9 @@ export async function stopCallGame(
   if (disconnectCall) {
     leaveVoiceCall(guildId);
   }
-  if (isServerStageBroadcastActive()) {
-    void stopServerScreenBroadcast().catch(() => {});
-  }
 
   activeRuntimes.delete(guildId);
   clearPersistedGameState(guildId);
-  emitCallGameBroadcastEvent({ type: "match_stopped", guildId });
   return getCallGameStatus(guildId);
 }
 
@@ -1768,7 +1969,6 @@ export async function cleanupAllCallGamesOnShutdown(
     }
 
     leaveVoiceCall(guildId);
-    await stopServerScreenBroadcast().catch(() => {});
 
     const guild =
       client.guilds.cache.get(guildId) ||
@@ -1803,7 +2003,6 @@ export async function cleanupAllCallGamesOnShutdown(
 
     activeRuntimes.delete(guildId);
     clearPersistedGameState(guildId);
-    emitCallGameBroadcastEvent({ type: "match_stopped", guildId });
   }
 }
 
@@ -1854,17 +2053,8 @@ export async function recoverOrphanedCallGameChannelsOnStartup(): Promise<void> 
   writePersistedGameStates({});
 }
 
-// Register process + Vite SSR module-reload hooks once safely via globalThis
+// Register real process shutdown hooks only (never wipe active games on Vite SSR reload!)
 const gAny = globalThis as any;
-if (typeof gAny.__callGameOnModuleReload === "function") {
-  // Previous instance existed inside the same Vite SSR Node process (code edit reload!)
-  Promise.resolve(
-    gAny.__callGameOnModuleReload("Edição ou problema detectado dentro do site.")
-  ).catch(() => {});
-}
-gAny.__callGameOnModuleReload = (reason: string) =>
-  cleanupAllCallGamesOnShutdown(reason);
-
 if (!gAny.__callGameProcessHooksRegistered) {
   gAny.__callGameProcessHooksRegistered = true;
 
@@ -1886,13 +2076,12 @@ if (!gAny.__callGameProcessHooksRegistered) {
   process.once("SIGTERM", () => void handleFatalOrSignal("SIGTERM", true, 0));
   process.on("uncaughtException", (err) => {
     console.error("[CallGame UncaughtException]:", err);
-    void handleFatalOrSignal("Erro interno no site", false, 1);
   });
 }
 
 /**
  * VoiceStateUpdate handler:
- * 1) Plays 3s welcome when users join lobby call
+ * 1) Plays 3s welcome when users join lobby call & re-evaluates all-ready gate
  * 2) Auto-deletes finished temporary private voice channel once everyone leaves
  */
 export async function handleCallGameVoiceStateUpdate(
@@ -1922,8 +2111,18 @@ export async function handleCallGameVoiceStateUpdate(
   const runtime = activeRuntimes.get(guildId);
   if (!runtime || !runtime.session.active || runtime.session.phase !== "lobby") return;
 
-  const member = newState.member;
+  const member = newState.member || oldState.member;
   if (!member || member.user.bot) return;
+
+  // Re-evaluate all-ready check if someone left the lobby call
+  if (
+    oldState.channelId === runtime.session.voiceChannelId &&
+    newState.channelId !== runtime.session.voiceChannelId
+  ) {
+    await updateLobbyPanelMessage(guild, runtime.session);
+    await checkAndNotifyAllPlayersReady(guild, runtime.session);
+    return;
+  }
 
   // Trigger only when user enters the normal lobby call
   if (
@@ -1943,10 +2142,12 @@ export async function handleCallGameVoiceStateUpdate(
     addGameEvent(runtime.session, `${member.displayName || member.user.username} entrou na call normal.`);
     await privChan
       .send({
-        content: `👋 <@${member.id}> entrou na call! Leia as regras acima e clique em **Estou Pronto**.`,
+        content: `👋 <@${member.id}> entrou na call! Leia as regras acima e clique em **Pronto** para se registrar.`,
       })
       .catch(() => {});
 
+    await updateLobbyPanelMessage(newState.guild, runtime.session);
+    await checkAndNotifyAllPlayersReady(newState.guild, runtime.session);
     scheduleLobbyWelcomeSpeech(runtime.session, `entrada de ${member.displayName || member.user.username}`);
   } catch (err) {
     console.error("[CallGame VoiceStateUpdate Error]:", err);
@@ -1975,50 +2176,57 @@ export async function handleCallGamePrivateMessage(message: Message): Promise<bo
   const displayName = player?.username || message.member?.displayName || message.author.username;
 
   if (!runtime.currentAnswers.has(expectedUserId)) {
-    const answeredAt = Date.now();
     runtime.currentAnswers.set(expectedUserId, {
       userId: expectedUserId,
       username: displayName,
       answer: answerText,
-      answeredAt,
-    });
-
-    emitCallGameBroadcastEvent({
-      type: "player_answered",
-      guildId: message.guild.id,
-      userId: expectedUserId,
-      username: displayName,
-      answeredAt,
+      answeredAt: Date.now(),
     });
 
     addGameEvent(runtime.session, `📩 ${displayName} respondeu no canal privado (${runtime.currentAnswers.size}/${runtime.session.matchPlayers.length}).`);
 
-    // Bot says OK, wipes all messages in this private channel leaving it completely empty, and saves the answer
     const textChan = message.channel as TextChannel;
-    await textChan.send({ content: "OK" }).catch(() => {});
 
-    // Short voice acknowledgment "OK"
+    // Delete player's text message immediately so the channel remains pristine
+    await message.delete().catch(() => {});
+
+    // Edit the existing question embed in this player's channel to confirm the answer is locked in
+    if (player?.questionMessageId) {
+      try {
+        const qMsg = await textChan.messages.fetch(player.questionMessageId).catch(() => null);
+        if (qMsg) {
+          const editedEmbed = new EmbedBuilder()
+            .setTitle(`⚖️ Pergunta ${(runtime.session.currentRoundIndex + 1)} de ${runtime.session.questions.length}`)
+            .setColor(SOLID_GREY_EMBED)
+            .setDescription(
+              `**${runtime.session.currentQuestion || "Pergunta"}**\n\n` +
+                `✅ **OK, sua resposta foi guardada!**\n` +
+                `Sua resposta: _"${sanitizeForSpeech(answerText, 250)}"_\n\n` +
+                `⏳ Aguarde todos responderem e acompanhe a próxima rodada na call!`
+            )
+            .setTimestamp();
+          await qMsg.edit({ embeds: [editedEmbed] }).catch(() => {});
+        }
+      } catch (err) {
+        console.warn("[CallGame Edit Question Embed Error]:", (err as Error).message);
+      }
+    }
+
+    // Immediate voice announcement in call with narrator voice
     const targetVoice = runtime.session.tempVoiceChannelId || runtime.session.voiceChannelId;
     void speakInVoiceCall(
       runtime.session.guildId,
       `OK! Resposta de ${sanitizeForSpeech(displayName, 40)} guardada.`,
       targetVoice,
-      runtime.session.voice,
-      undefined,
-      runtime.session.expression,
-      { kind: "ack" }
+      "narrator"
     ).catch(() => {});
-
-    setTimeout(() => {
-      void purgeAllMessagesInChannel(textChan);
-    }, 850);
 
     // If every player in the match has answered, finish the round early!
     if (runtime.currentAnswers.size >= runtime.session.matchPlayers.length && runtime.roundDoneResolver) {
       runtime.roundDoneResolver();
     }
   } else {
-    // Already answered this round: keep channel clean
+    // Already answered this round: delete message to keep channel clean
     await message.delete().catch(() => {});
   }
 
@@ -2026,7 +2234,8 @@ export async function handleCallGamePrivateMessage(message: Message): Promise<bo
 }
 
 /**
- * Triggered when a user clicks "✅ Estou Pronto"
+ * Triggered when a user clicks the "Pronto" button in #🔒・jogo-da-call.
+ * Opens an ephemeral message visible only to that user to set custom name and gender.
  */
 export async function handleCallGameReadyClick(interaction: ButtonInteraction): Promise<void> {
   const guild = interaction.guild;
@@ -2045,80 +2254,467 @@ export async function handleCallGameReadyClick(interaction: ButtonInteraction): 
     return;
   }
 
-  const { session } = runtime;
-  const member = interaction.member as GuildMember | null;
-  const displayName = member?.displayName || interaction.user.globalName || interaction.user.username;
-  const spokenName = sanitizeForSpeech(displayName, 60);
-  const avatarUrl = interaction.user.displayAvatarURL({ size: 256, extension: "png" });
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const isOwner = isGameOwner(runtime.session, interaction.user.id);
+  const existingReady = runtime.session.readyPlayers.find((p) => p.userId === interaction.user.id);
+  const initialGender = existingReady?.gender || ("m" as const);
+  const autoVoiceIdx = runtime.session.readyPlayers.length;
+  const currentDraft: PlayerDraftSetup = playerDrafts.get(draftKey) || {
+    customName:
+      existingReady?.username ||
+      (interaction.member as GuildMember)?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username,
+    gender: initialGender,
+    voiceId: resolvePortugueseVoiceId(existingReady?.voiceId, initialGender, autoVoiceIdx, isOwner),
+  };
+  currentDraft.voiceId = resolvePortugueseVoiceId(currentDraft.voiceId, currentDraft.gender, autoVoiceIdx, isOwner);
+  playerDrafts.set(draftKey, currentDraft);
 
-  const alreadyReady = session.readyPlayers.some((p) => p.userId === interaction.user.id);
-  if (!alreadyReady) {
-    session.readyPlayers.push({
-      userId: interaction.user.id,
-      username: displayName,
-      avatar: avatarUrl,
-      readyAt: Date.now(),
-    });
-    emitCallGameBroadcastEvent({
-      type: "lobby_ready_update",
-      guildId: guild.id,
-      players: session.readyPlayers.map((rp) => ({
-        userId: rp.userId,
-        username: rp.username,
-        avatar: rp.avatar || null,
-      })),
-    });
+  const embed = buildPlayerSetupEmbed(currentDraft, isOwner);
+  const components = buildPlayerSetupComponents(guild.id, currentDraft);
+
+  await interaction.reply({
+    embeds: [embed],
+    components,
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Triggered when the user clicks "✏️ Alterar Nome" inside their ephemeral setup message.
+ * Displays a Discord modal with a short text input for their custom identifier.
+ */
+export async function handleCallGameOpenNameModal(interaction: ButtonInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    await interaction.reply({ content: "⚠️ Esta ação só pode ser realizada dentro de um servidor.", ephemeral: true }).catch(() => {});
+    return;
   }
 
-  addGameEvent(session, `✅ ${displayName} está pronto.`);
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const current = playerDrafts.get(draftKey);
+  const currentName =
+    current?.customName ||
+    (interaction.member as GuildMember)?.displayName ||
+    interaction.user.globalName ||
+    interaction.user.username;
 
-  const isOwner = interaction.user.id === session.ownerUserId;
+  const modal = new ModalBuilder()
+    .setCustomId(`callgame_modal_name:${guild.id}`)
+    .setTitle("Identificador no Jogo");
 
-  try {
-    await interaction.update({
-      embeds: [buildLobbyEmbed(session)],
-      components: [buildLobbyComponents(session)],
-    });
-    await interaction
-      .followUp({
-        content: isOwner
-          ? "👑 Você é o dono! Quando todos estiverem prontos na call, clique no seu botão privado abaixo para **Começar Tudo** e puxar todos para a call principal:"
-          : alreadyReady
-          ? "✅ Você já estava pronto! Anunciando novamente na call."
-          : "✅ Você confirmou que está pronto! O bot está anunciando na call.",
-        components: isOwner ? [buildOwnerPrivateControlRow(guild.id)] : [],
-        ephemeral: true,
-      })
-      .catch(() => {});
-  } catch {
-    await interaction
-      .reply({
-        content: "✅ Você confirmou que está pronto! O bot está anunciando na call.",
-        ephemeral: true,
-      })
-      .catch(() => {});
+  const nameInput = new TextInputBuilder()
+    .setCustomId("player_custom_name")
+    .setLabel("Seu Nome / Identificador no Jogo:")
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(32)
+    .setMinLength(2)
+    .setPlaceholder("Ex: Carlos, Ana, Detetive...")
+    .setRequired(true);
+
+  if (currentName && currentName.trim().length > 0) {
+    nameInput.setValue(currentName.trim().slice(0, 32));
   }
 
+  const row = new ActionRowBuilder<TextInputBuilder>().addComponents(nameInput);
+  modal.addComponents(row);
+
   try {
-    await speakInVoiceCall(
-      guild.id,
-      `O usuário ${spokenName} está pronto!`,
-      session.voiceChannelId,
-      session.voice,
-      undefined,
-      session.expression,
-      {
-        kind: "lobby_speech",
-        displayText: `${displayName} está pronto!`,
-      }
-    );
-  } catch (err) {
-    addGameEvent(session, `Erro ao anunciar jogador pronto: ${(err as Error).message}`);
+    await interaction.showModal(modal);
+  } catch (err: any) {
+    console.error("[CallGame ShowNameModal Error]:", err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: `⚠️ Não foi possível abrir o formulário: ${err?.message || "erro interno"}. Tente novamente.`,
+        ephemeral: true,
+      }).catch(() => {});
+    }
   }
 }
 
 /**
- * Triggered ONLY by the owner (1554257592015003674) clicking "👑 Começar Tudo"
+ * Triggered when the user submits the custom name modal.
+ */
+export async function handleCallGameNameModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  const runtime = activeRuntimes.get(guild.id);
+  const isOwner = isGameOwner(runtime?.session, interaction.user.id);
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const customName =
+    interaction.fields.getTextInputValue("player_custom_name").trim() || interaction.user.username;
+  const current: PlayerDraftSetup = playerDrafts.get(draftKey) || {
+    customName,
+    gender: "m" as const,
+    voiceId: getVoicePoolForGender("m", isOwner)[0].id,
+  };
+  current.customName = customName;
+  current.voiceId = resolvePortugueseVoiceId(current.voiceId, current.gender, 0, isOwner);
+  playerDrafts.set(draftKey, current);
+
+  const embed = buildPlayerSetupEmbed(current, isOwner);
+  const components = buildPlayerSetupComponents(guild.id, current);
+
+  await interaction.reply({
+    content: `✅ Identificador salvo como: **${customName}**! Agora escolha o sexo/voz e clique em **Confirmar Pronto**.`,
+    embeds: [embed],
+    components,
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Triggered when the user clicks "🎭 Trocar Voz TikTok" to cycle through Portuguese TikTok voices.
+ * Exclusive funny Portuguese voices are unlocked ONLY for the game owner / starter.
+ */
+export async function handleCallGameCycleVoice(interaction: ButtonInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  const runtime = activeRuntimes.get(guild.id);
+  const isOwner = isGameOwner(runtime?.session, interaction.user.id);
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const current: PlayerDraftSetup = playerDrafts.get(draftKey) || {
+    customName:
+      (interaction.member as GuildMember)?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username,
+    gender: "m" as const,
+    voiceId: getVoicePoolForGender("m", isOwner)[0].id,
+  };
+
+  const pool = getVoicePoolForGender(current.gender, isOwner);
+  const idx = pool.findIndex((v) => v.id === current.voiceId);
+  const nextIdx = (idx + 1) % pool.length;
+  current.voiceId = pool[nextIdx].id;
+  playerDrafts.set(draftKey, current);
+
+  const embed = buildPlayerSetupEmbed(current, isOwner);
+  const components = buildPlayerSetupComponents(guild.id, current);
+
+  await interaction.update({
+    embeds: [embed],
+    components,
+  }).catch(() => {});
+}
+
+/**
+ * Triggered when the user clicks "👨 Masculino" or "👩 Feminino".
+ */
+export async function handleCallGameSetGender(
+  interaction: ButtonInteraction,
+  gender: "m" | "f"
+): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  const runtime = activeRuntimes.get(guild.id);
+  const isOwner = isGameOwner(runtime?.session, interaction.user.id);
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const pool = getVoicePoolForGender(gender, isOwner);
+  const current: PlayerDraftSetup = playerDrafts.get(draftKey) || {
+    customName:
+      (interaction.member as GuildMember)?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username,
+    gender,
+    voiceId: pool[0].id,
+  };
+  current.gender = gender;
+  // Auto-switch to a matching Portuguese voice (exclusive funny voices included only if isOwner)
+  if (!pool.some((v) => v.id === current.voiceId)) {
+    const sameGenderCount = runtime
+      ? runtime.session.readyPlayers.filter((p) => p.gender === gender && p.userId !== interaction.user.id).length
+      : 0;
+    current.voiceId = pool[sameGenderCount % pool.length].id;
+  }
+  playerDrafts.set(draftKey, current);
+
+  const embed = buildPlayerSetupEmbed(current, isOwner);
+  const components = buildPlayerSetupComponents(guild.id, current);
+
+  await interaction.update({
+    embeds: [embed],
+    components,
+  }).catch(() => {});
+}
+
+/**
+ * Triggered when the user clicks "✅ Confirmar Pronto".
+ * Registers the player in the match, updates the lobby embed, and announces immediately on voice call with narrator voice.
+ */
+export async function handleCallGameConfirmReady(interaction: ButtonInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  const runtime = activeRuntimes.get(guild.id);
+  if (!runtime || !runtime.session.active) {
+    await interaction.reply({ content: "⚠️ Jogo da Call não está ativo.", ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const { session } = runtime;
+  const isOwner = isGameOwner(session, interaction.user.id);
+  const draftKey = `${guild.id}:${interaction.user.id}`;
+  const draft: PlayerDraftSetup = playerDrafts.get(draftKey) || {
+    customName:
+      (interaction.member as GuildMember)?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username,
+    gender: "m" as const,
+    voiceId: getVoicePoolForGender("m", isOwner)[0].id,
+  };
+
+  const finalName = sanitizeForSpeech(draft.customName, 40);
+  const gender = draft.gender;
+  const voiceId = resolvePortugueseVoiceId(draft.voiceId, gender, session.readyPlayers.length, isOwner);
+  const voiceLabel = getVoiceLabel(voiceId, gender);
+
+  const existingIdx = session.readyPlayers.findIndex((p) => p.userId === interaction.user.id);
+  if (existingIdx >= 0) {
+    session.readyPlayers[existingIdx].username = finalName;
+    session.readyPlayers[existingIdx].gender = gender;
+    session.readyPlayers[existingIdx].voiceId = voiceId;
+  } else {
+    session.readyPlayers.push({
+      userId: interaction.user.id,
+      username: finalName,
+      gender,
+      voiceId,
+      readyAt: Date.now(),
+    });
+  }
+
+  addGameEvent(session, `✅ ${finalName} (${gender === "f" ? "Feminino" : "Masculino"} · ${voiceLabel}) está pronto!`);
+  await updateLobbyPanelMessage(guild, session);
+  await checkAndNotifyAllPlayersReady(guild, session);
+
+  await interaction.update({
+    content: `✅ **Você está pronto!**\n• Identificador: **${finalName}**\n• Sexo: **${gender === "f" ? "Feminino" : "Masculino"}**\n• Voz TikTok: **${voiceLabel}**\n\n${
+      interaction.user.id === session.ownerUserId
+        ? "👑 **Você é o dono!** Assim que todos os participantes estiverem prontos, a mensagem com o botão **Começar** será liberada no canal compartilhado."
+        : "⏳ Aguardando todos os participantes e o dono confirmarem para liberar o botão de início."
+    }`,
+    embeds: [],
+    components: [],
+  }).catch(() => {});
+
+  // Immediate voice speech with narrator voice (TikTok br_005)
+  const voiceAnnouncement =
+    gender === "f"
+      ? `A jogadora ${finalName} está pronta!`
+      : `O jogador ${finalName} está pronto!`;
+
+  try {
+    await speakInVoiceCall(
+      guild.id,
+      voiceAnnouncement,
+      session.voiceChannelId,
+      "narrator"
+    );
+  } catch (err) {
+    console.warn("[CallGame Ready Announce Warning]:", (err as Error).message);
+  }
+}
+
+/**
+ * Triggered when a participant clicks "✍️ Responder" in the shared channel during an active round.
+ * Opens a direct Discord Modal text box for the user to type and submit their answer directly.
+ */
+export async function handleCallGameOpenAnswerModal(interaction: ButtonInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    await interaction.reply({
+      content: "⚠️ Esta ação só pode ser realizada dentro de um servidor.",
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  const runtime = activeRuntimes.get(guild.id);
+  if (!runtime || !runtime.session.active || runtime.session.phase !== "playing" || !runtime.roundActive) {
+    await interaction.reply({
+      content: "⚠️ Não há nenhuma rodada ativa no momento ou o tempo limite já encerrou.",
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  const parts = interaction.customId.split(":");
+  const parsedRound = Number(parts[2]);
+  const roundIdx = Number.isFinite(parsedRound) ? parsedRound : runtime.session.currentRoundIndex;
+
+  // Auto-enroll participant if they were ready or are in the game voice channel / owner
+  let isMatchPlayer = runtime.session.matchPlayers.some((p) => p.userId === interaction.user.id);
+  if (!isMatchPlayer) {
+    const isReady = runtime.session.readyPlayers.some((p) => p.userId === interaction.user.id);
+    const member = (interaction.member as GuildMember) || (await guild.members.fetch(interaction.user.id).catch(() => null));
+    const targetVoiceId = runtime.session.tempVoiceChannelId || runtime.session.voiceChannelId;
+    const inVoice = Boolean(member?.voice?.channelId && member.voice.channelId === targetVoiceId);
+    const isOwner = interaction.user.id === runtime.session.ownerUserId;
+
+    if (isReady || inVoice || isOwner) {
+      const readyInfo = runtime.session.readyPlayers.find((rp) => rp.userId === interaction.user.id);
+      const chosenName = readyInfo?.username || member?.displayName || interaction.user.globalName || interaction.user.username;
+      const chosenGender: "m" | "f" = readyInfo?.gender || "m";
+      const chosenVoiceId = resolvePortugueseVoiceId(
+        readyInfo?.voiceId,
+        chosenGender,
+        runtime.session.matchPlayers.length,
+        isOwner
+      );
+
+      runtime.session.matchPlayers.push({
+        userId: interaction.user.id,
+        username: sanitizeForSpeech(chosenName, 40),
+        gender: chosenGender,
+        voiceId: chosenVoiceId,
+        privateTextChannelId: null,
+        questionMessageId: null,
+        totalPoints: 0,
+      });
+      isMatchPlayer = true;
+    }
+  }
+
+  if (!isMatchPlayer) {
+    await interaction.reply({
+      content: "⚠️ Você não está registrado como participante desta partida.",
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  const currentAnswer = runtime.currentAnswers.get(interaction.user.id)?.answer;
+
+  const modal = new ModalBuilder()
+    .setCustomId(`callgame_modal_answer:${guild.id}:${roundIdx}`)
+    .setTitle(`Resposta - Pergunta ${roundIdx + 1}`.slice(0, 45));
+
+  const answerInput = new TextInputBuilder()
+    .setCustomId("round_answer")
+    .setLabel("Sua Resposta:")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(300)
+    .setMinLength(2)
+    .setPlaceholder("Digite sua resposta aqui para a pergunta...")
+    .setRequired(true);
+
+  // CRITICAL: Discord API throws 400 Bad Request if value is an empty string ("")
+  // Only call .setValue() when there is an existing non-empty answer previously recorded!
+  if (currentAnswer && currentAnswer.trim().length > 0) {
+    answerInput.setValue(currentAnswer.trim().slice(0, 300));
+  }
+
+  const row = new ActionRowBuilder<TextInputBuilder>().addComponents(answerInput);
+  modal.addComponents(row);
+
+  try {
+    await interaction.showModal(modal);
+  } catch (err: any) {
+    console.error("[CallGame ShowAnswerModal Error]:", err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: `⚠️ Não foi possível abrir o campo de texto: ${err?.message || "erro de comunicação"}. Tente clicar novamente!`,
+        ephemeral: true,
+      }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Triggered when the user submits their direct text box answer via Modal.
+ */
+export async function handleCallGameAnswerModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    await interaction.reply({
+      content: "⚠️ Esta ação só pode ser realizada dentro de um servidor.",
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  try {
+    const runtime = activeRuntimes.get(guild.id);
+    if (!runtime || !runtime.session.active || runtime.session.phase !== "playing" || !runtime.roundActive) {
+      await interaction.reply({
+        content: "⚠️ O tempo para responder esta pergunta já encerrou.",
+        ephemeral: true,
+      }).catch(() => {});
+      return;
+    }
+
+    const parts = interaction.customId.split(":");
+    const roundIdx = Number(parts[2]);
+    if (roundIdx !== runtime.session.currentRoundIndex) {
+      await interaction.reply({
+        content: "⚠️ Esta rodada já avançou para outra pergunta.",
+        ephemeral: true,
+      }).catch(() => {});
+      return;
+    }
+
+    const rawAnswer = interaction.fields.getTextInputValue("round_answer")?.trim();
+    if (!rawAnswer) {
+      await interaction.reply({
+        content: "⚠️ A resposta não pode estar vazia.",
+        ephemeral: true,
+      }).catch(() => {});
+      return;
+    }
+
+    const player = runtime.session.matchPlayers.find((p) => p.userId === interaction.user.id);
+    const displayName = player?.username || (interaction.member as GuildMember)?.displayName || interaction.user.username;
+
+    const isFirstAnswer = !runtime.currentAnswers.has(interaction.user.id);
+    runtime.currentAnswers.set(interaction.user.id, {
+      userId: interaction.user.id,
+      username: displayName,
+      answer: rawAnswer,
+      answeredAt: Date.now(),
+    });
+
+    await interaction.reply({
+      content: `✅ **Sua resposta foi registrada com sucesso!**\n> _"${sanitizeForSpeech(rawAnswer, 250)}"_\n\n⏳ Acompanhe a call para a revelação das respostas e vencedor!`,
+      ephemeral: true,
+    }).catch(() => {});
+
+    addGameEvent(
+      runtime.session,
+      `📩 ${displayName} respondeu na caixa de texto (${runtime.currentAnswers.size}/${runtime.session.matchPlayers.length}).`
+    );
+
+    await refreshSharedRoundMessage(guild, runtime, runtime.session.currentRoundIndex, false);
+
+    if (isFirstAnswer) {
+      const targetVoice = runtime.session.tempVoiceChannelId || runtime.session.voiceChannelId;
+      void speakInVoiceCall(
+        runtime.session.guildId,
+        `OK! Resposta de ${sanitizeForSpeech(displayName, 40)} guardada.`,
+        targetVoice,
+        "narrator"
+      ).catch(() => {});
+    }
+
+    if (runtime.currentAnswers.size >= runtime.session.matchPlayers.length && runtime.roundDoneResolver) {
+      runtime.roundDoneResolver();
+    }
+  } catch (err: any) {
+    console.error("[CallGame AnswerModalSubmit Error]:", err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: `⚠️ Erro ao salvar sua resposta: ${err?.message || "erro interno"}`,
+        ephemeral: true,
+      }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Triggered ONLY by the owner clicking "Começar" on the readiness card.
  */
 export async function handleCallGameOwnerStartClick(interaction: ButtonInteraction): Promise<void> {
   const guild = interaction.guild;
@@ -2140,7 +2736,7 @@ export async function handleCallGameOwnerStartClick(interaction: ButtonInteracti
   if (interaction.user.id !== runtime.session.ownerUserId) {
     await interaction
       .reply({
-        content: `🚫 **Botão privado!** Apenas o dono (<@${runtime.session.ownerUserId}>) pode clicar em **Começar Tudo**.`,
+        content: `🚫 **Aviso:** Somente o dono (<@${runtime.session.ownerUserId}>) pode iniciar a partida!`,
         ephemeral: true,
       })
       .catch(() => {});
@@ -2153,13 +2749,13 @@ export async function handleCallGameOwnerStartClick(interaction: ButtonInteracti
     const updated = await beginCallGameMatch(guild.id, interaction.user.id);
     await interaction
       .editReply({
-        content: `🚀 **Tudo iniciado!** Todos foram movidos para <#${updated.tempVoiceChannelId}> e cada jogador recebeu seu canal privado de respostas!`,
+        content: `🚀 **Partida iniciada com sucesso!** Todos foram movidos para <#${updated.tempVoiceChannelId}> e as perguntas serão enviadas neste canal compartilhado.`,
       })
       .catch(() => {});
   } catch (err) {
     await interaction
       .editReply({
-        content: `❌ Erro ao iniciar partida: ${(err as Error).message}`,
+        content: `❌ Não foi possível iniciar a partida: ${(err as Error).message}`,
       })
       .catch(() => {});
   }

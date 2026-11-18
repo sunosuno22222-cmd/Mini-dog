@@ -41,10 +41,19 @@ export interface PollData {
 }
 
 const POLLS_FILE = path.join(process.cwd(), "polls_data.json");
-const pollsMap = new Map<string, PollData>();
+const gPolls = globalThis as any;
+if (!gPolls.__pollsState) {
+  gPolls.__pollsState = {
+    pollsMap: new Map<string, PollData>(),
+    loaded: false,
+  };
+}
+const pollsMap: Map<string, PollData> = gPolls.__pollsState.pollsMap;
 
 // Load polls from disk
 async function loadPollsFromDisk() {
+  if (gPolls.__pollsState.loaded) return;
+  gPolls.__pollsState.loaded = true;
   try {
     const raw = await fs.readFile(POLLS_FILE, "utf8");
     const arr: PollData[] = JSON.parse(raw);

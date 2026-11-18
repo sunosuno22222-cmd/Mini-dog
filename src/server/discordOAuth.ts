@@ -47,8 +47,19 @@ const OAUTH_SCOPES = "identify guilds";
 const DISK_SESSION_FILE = path.join(process.cwd(), ".discord-oauth-session.enc.json");
 const DISK_KEY_FILE = path.join(process.cwd(), ".oauth-session.key");
 
-const pendingStates = new Map<string, PendingOAuthState>();
-const sessionsById = new Map<string, StoredOAuthSession>();
+const gOAuth = globalThis as any;
+if (!gOAuth.__discordOAuthState) {
+  gOAuth.__discordOAuthState = {
+    pendingStates: new Map<string, PendingOAuthState>(),
+    sessionsById: new Map<string, StoredOAuthSession>(),
+  };
+}
+const pendingStates: Map<string, PendingOAuthState> = gOAuth.__discordOAuthState.pendingStates;
+const sessionsById: Map<string, StoredOAuthSession> = gOAuth.__discordOAuthState.sessionsById;
+
+export function hasPendingDiscordOAuthState(state: string): boolean {
+  return Boolean(state && pendingStates.has(state));
+}
 
 function getEncryptionKey(): Buffer {
   const secretSource = process.env.DISCORD_CLIENT_SECRET?.trim();

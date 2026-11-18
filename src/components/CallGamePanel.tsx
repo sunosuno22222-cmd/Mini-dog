@@ -28,6 +28,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { BroadcastStage } from "@/components/BroadcastStage";
 import { useBroadcastSocket } from "@/hooks/useBroadcastSocket";
+import { apiFetch } from "@/lib/api";
 
 interface GuildChannel {
   id: string;
@@ -126,7 +127,7 @@ interface ServerScreenStatusInfo {
 const SESSION_REF_KEY = "discord_tx_session_ref";
 
 interface CallGamePanelProps {
-  password: string;
+  password?: string;
   guildId: string | null;
   channels: GuildChannel[];
   voiceChannelId: string;
@@ -198,7 +199,7 @@ const DEFAULT_QUESTIONS_TEXT = [
 ].join("\n");
 
 export function CallGamePanel({
-  password,
+  password = "",
   guildId,
   channels,
   voiceChannelId,
@@ -208,8 +209,14 @@ export function CallGamePanel({
   const voiceChannels = channels.filter((c) => c.type === 2 || c.type === 13);
   const textChannels = channels.filter((c) => c.type === 0 || c.type === 5);
 
+  useEffect(() => {
+    if (!voiceChannelId && voiceChannels.length > 0) {
+      setVoiceChannelId(voiceChannels[0].id);
+    }
+  }, [voiceChannelId, voiceChannels, setVoiceChannelId]);
+
   const [game, setGame] = useState<CallGameSession | null>(null);
-  const [selectedVoice, setSelectedVoice] = useState("lhays_anime");
+  const [selectedVoice, setSelectedVoice] = useState("narrator");
   const [selectedExpression, setSelectedExpression] = useState("shy");
   const [ownerUserId, setOwnerUserId] = useState("1554257592015003674");
   const [smsChannelId, setSmsChannelId] = useState("");
@@ -286,8 +293,9 @@ export function CallGamePanel({
   }, []);
 
   const fetchServerScreenStatus = useCallback(async () => {
+    if (!guildId) return;
     try {
-      const res = await fetch("/api/discord/broadcast/server-status", {
+      const res = await apiFetch(`/api/guilds/${guildId}/broadcast/server-status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password, refresh: false }),
@@ -297,7 +305,7 @@ export function CallGamePanel({
         setServerScreen(data.state);
       }
     } catch {}
-  }, [password]);
+  }, [guildId, password]);
 
   useEffect(() => {
     fetchOAuthSession();
@@ -385,7 +393,7 @@ export function CallGamePanel({
   const handleSaveCustomLink = async () => {
     setSavingCustomLink(true);
     try {
-      const res = await fetch("/api/auth/discord/custom-link", {
+      const res = await apiFetch("/api/auth/discord/custom-link-panel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password, link: customLinkInput }),
@@ -417,11 +425,7 @@ export function CallGamePanel({
   const fetchGameStatus = async () => {
     if (!guildId) return;
     try {
-      const res = await fetch("/api/discord/call-game/status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password, guildId }),
-      });
+      const res = await apiFetch(`/api/guilds/${guildId}/call-game/status`);
       const data = await res.json();
       if (data.success && data.game) {
         setGame(data.game);
@@ -450,10 +454,6 @@ export function CallGamePanel({
 
   const handleStartLobby = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!oauthConnected) {
-      toast.error("Conexão obrigatória: conecte uma conta Discord via OAuth2 antes de iniciar o jogo!");
-      return;
-    }
     if (!guildId || !voiceChannelId) {
       toast.error("Selecione a call normal para iniciar o Jogo da Call!");
       return;
@@ -471,9 +471,8 @@ export function CallGamePanel({
 
     setBusy(true);
     try {
-      const res = await fetch("/api/discord/call-game/start", {
+      const res = await apiFetch(`/api/guilds/${guildId}/call-game/start`, {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json", ...getSessionHeaders() },
         body: JSON.stringify({
           password,
@@ -508,7 +507,7 @@ export function CallGamePanel({
     if (!guildId) return;
     setBusy(true);
     try {
-      const res = await fetch("/api/discord/call-game/begin-match", {
+      const res = await apiFetch(`/api/guilds/${guildId}/call-game/begin-match`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password, guildId }),
@@ -528,7 +527,7 @@ export function CallGamePanel({
     if (!guildId) return;
     setBusy(true);
     try {
-      const res = await fetch("/api/discord/call-game/stop", {
+      const res = await apiFetch(`/api/guilds/${guildId}/call-game/stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1038,9 +1037,28 @@ export function CallGamePanel({
               onChange={(e) => setSelectedVoice(e.target.value)}
               className="h-10 w-full rounded-lg border border-white/[0.1] bg-[#141926] px-3 text-xs text-white focus:outline-none focus:border-pink-500"
             >
-              <option value="lhays_anime">Dubladora Anime BR (Lhays Macedo)</option>
-              <option value="garota_timida">Anime Girl Shy (Garota Tímida)</option>
-              <option value="anytospeech_mcp">AnyToSpeech MCP</option>
+              <optgroup label="👑 Exclusivas de Quem Começa — Engraçadas (PT-BR)">
+                <option value="tiktok_funny_male">🤡 Zé Maluco / Esquilo (PT-BR Masculina Engraçada)</option>
+                <option value="tiktok_funny_male_grumpy">🐸 Pato / Voz Engrossada (PT-BR Masculina Engraçada)</option>
+                <option value="tiktok_funny_female">🤪 Paty Esquilo / Maluca (PT-BR Feminina Engraçada)</option>
+                <option value="tiktok_funny_female_drama">🎭 Tia Dramática / Doida (PT-BR Feminina Engraçada)</option>
+              </optgroup>
+              <optgroup label="Vozes Portuguesas Masculinas (TikTok PT-BR)">
+                <option value="narrator">🎙️ Lucas / Narrador (PT-BR Masculino)</option>
+                <option value="tiktok_contra">🧔 Contra / Luiz (PT-BR Masculino)</option>
+                <option value="tiktok_bueno">⚽ Galvão Bueno (PT-BR Masculino)</option>
+                <option value="tiktok_bv_male">🎧 Bruno (PT-BR Masculino)</option>
+              </optgroup>
+              <optgroup label="Vozes Portuguesas Femininas (TikTok PT-BR)">
+                <option value="tiktok_laizza">👩 Laizza (PT-BR Feminino)</option>
+                <option value="lhays_anime">🎀 Lhays Macedo (PT-BR Feminino)</option>
+                <option value="tiktok_ivete">🎤 Ivete Sangalo (PT-BR Feminino)</option>
+                <option value="tiktok_ludmilla">🎶 Ludmilla (PT-BR Feminino)</option>
+                <option value="garota_timida">🌸 Júlia / Tímida (PT-BR Feminino)</option>
+                <option value="tiktok_br_f1">✨ Camila (PT-BR Feminino)</option>
+                <option value="tiktok_br_f3">💎 Ana (PT-BR Feminino)</option>
+              </optgroup>
+              <option value="anytospeech_mcp">⚡ AnyToSpeech MCP</option>
               {clonedVoices.map((cv) => (
                 <option key={cv.id} value={cv.id}>
                   Voz Clonada: {cv.name}
@@ -1174,19 +1192,12 @@ export function CallGamePanel({
 
             <Button
               type="submit"
-              disabled={busy || !voiceChannelId || !oauthConnected}
-              title={
-                !oauthConnected
-                  ? "Conecte sua conta Discord via OAuth2 primeiro"
-                  : undefined
-              }
-              className="h-9 bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white text-xs font-semibold px-4 cursor-pointer"
+              disabled={busy || !voiceChannelId}
+              className="h-9 bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold px-4 cursor-pointer"
             >
               <Play className="h-3.5 w-3.5 mr-1.5" />
               {busy
                 ? "Iniciando..."
-                : !oauthConnected
-                ? "Conecte o Discord Primeiro"
                 : game?.active
                 ? "Reiniciar Lobby na Call"
                 : "Abrir Lobby na Call Normal"}

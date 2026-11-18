@@ -18,72 +18,35 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
-export type VoiceSpeechKind =
-  | "announcement"
-  | "lobby_speech"
-  | "question"
-  | "answer_reveal"
-  | "round_winner"
-  | "leaderboard"
-  | "final_winner"
-  | "ack"
-  | "general";
-
-export interface VoiceSpeechMeta {
-  kind?: VoiceSpeechKind;
-  displayText?: string;
-  roundIndex?: number;
-  questionNumber?: number;
-  totalQuestions?: number;
-  question?: string;
-  userId?: string;
-  username?: string;
-  avatar?: string | null;
-  answer?: string;
-  didAnswer?: boolean;
-  totalPoints?: number;
-  winningAnswer?: string | null;
-  explanation?: string;
-}
-
 export interface VoicePlaybackEvent {
   type: "speech:start" | "speech:end" | "speech:idle";
   guildId: string;
   clipId?: string;
-  meta?: VoiceSpeechMeta;
   timestamp: number;
-}
-
-type VoicePlaybackListener = (event: VoicePlaybackEvent) => void;
-
-const gVoiceAny = globalThis as any;
-if (!gVoiceAny.__voicePlaybackListeners) {
-  gVoiceAny.__voicePlaybackListeners = new Set<VoicePlaybackListener>();
-}
-
-export function onVoicePlaybackEvent(listener: VoicePlaybackListener): () => void {
-  const listeners: Set<VoicePlaybackListener> = gVoiceAny.__voicePlaybackListeners;
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
+  meta?: {
+    kind?: string;
+    displayText?: string;
+    userId?: string;
+    username?: string;
+    avatar?: string | null;
+    questionNumber?: number;
+    totalQuestions?: number;
+    question?: string;
+    answer?: string;
+    didAnswer?: boolean;
+    totalPoints?: number;
+    winningAnswer?: string | null;
+    explanation?: string;
   };
 }
 
-function emitVoicePlaybackEvent(event: VoicePlaybackEvent): void {
-  const listeners: Set<VoicePlaybackListener> = gVoiceAny.__voicePlaybackListeners;
-  for (const fn of listeners) {
-    try {
-      fn(event);
-    } catch (err) {
-      console.warn("[Voice Playback Listener Error]:", (err as Error).message);
-    }
-  }
-}
+const voiceEventListeners = new Set<(ev: VoicePlaybackEvent) => void>();
 
-interface VoiceQueueItem {
-  audioUrl: string;
-  clipId: string;
-  meta?: VoiceSpeechMeta;
+export function onVoicePlaybackEvent(listener: (ev: VoicePlaybackEvent) => void): () => void {
+  voiceEventListeners.add(listener);
+  return () => {
+    voiceEventListeners.delete(listener);
+  };
 }
 
 interface GuildVoiceSession {
@@ -91,8 +54,7 @@ interface GuildVoiceSession {
   player: AudioPlayer;
   channelId: string;
   channelName: string;
-  queue: VoiceQueueItem[];
-  currentClip: VoiceQueueItem | null;
+  queue: string[];
   isPlaying: boolean;
 }
 
@@ -195,7 +157,6 @@ export async function joinVoiceCall(guildId: string, channelId: string): Promise
     channelId,
     channelName: channel.name,
     queue: [],
-    currentClip: null,
     isPlaying: false,
   };
 
@@ -228,55 +189,17 @@ export async function joinVoiceCall(guildId: string, channelId: string): Promise
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
-    const finished = session.currentClip;
-    session.currentClip = null;
-    if (finished) {
-      emitVoicePlaybackEvent({
-        type: "speech:end",
-        guildId,
-        clipId: finished.clipId,
-        meta: finished.meta,
-        timestamp: Date.now(),
-      });
-    }
     setTimeout(() => {
       session.isPlaying = false;
-      if (session.queue.length === 0) {
-        emitVoicePlaybackEvent({
-          type: "speech:idle",
-          guildId,
-          timestamp: Date.now(),
-        });
-      } else {
-        processNextInQueue(guildId);
-      }
+      processNextInQueue(guildId);
     }, 450);
   });
 
   player.on("error", (error) => {
     console.error("[Discord Voice Audio Error]:", error);
-    const failed = session.currentClip;
-    session.currentClip = null;
-    if (failed) {
-      emitVoicePlaybackEvent({
-        type: "speech:end",
-        guildId,
-        clipId: failed.clipId,
-        meta: failed.meta,
-        timestamp: Date.now(),
-      });
-    }
     setTimeout(() => {
       session.isPlaying = false;
-      if (session.queue.length === 0) {
-        emitVoicePlaybackEvent({
-          type: "speech:idle",
-          guildId,
-          timestamp: Date.now(),
-        });
-      } else {
-        processNextInQueue(guildId);
-      }
+      processNextInQueue(guildId);
     }, 300);
   });
 
@@ -324,32 +247,36 @@ export async function waitForVoiceQueueIdle(guildId: string, timeoutMs = 120_000
   }
 }
 
-async function applyFairyVoiceFilter(inputBuffer: Buffer): Promise<Buffer> {
+async function applyFfmpegVoiceFilter(inputBuffer: Buffer, filterChain: string): Promise<Buffer> {
   const tmpId = crypto.randomBytes(8).toString("hex");
   const inputPath = path.join(os.tmpdir(), `tts_in_${tmpId}.mp3`);
   const outputPath = path.join(os.tmpdir(), `tts_out_${tmpId}.mp3`);
 
   try {
     await fs.writeFile(inputPath, inputBuffer);
-    
+
     await new Promise((resolve, reject) => {
       const args = [
         "-y",
         "-i", inputPath,
-        "-filter:a", "asetrate=24000*1.38,aresample=24000,atempo=0.95",
-        outputPath
+        "-af", filterChain,
+        "-f", "mp3",
+        outputPath,
       ];
       const proc = spawn("ffmpeg", args);
       let errLog = "";
       proc.stderr.on("data", (d) => { errLog += d.toString(); });
       proc.on("close", (code) => {
         if (code === 0) resolve(true);
-        else reject(new Error(`FFmpeg exited with code ${code}: ${errLog}`));
+        else reject(new Error(`FFmpeg exited with code ${code}: ${errLog.slice(-300)}`));
       });
     });
 
     const outBuffer = await fs.readFile(outputPath);
     return outBuffer;
+  } catch (err) {
+    console.warn("[Voice DSP Filter Warning]:", (err as Error).message);
+    return inputBuffer;
   } finally {
     await fs.unlink(inputPath).catch(() => {});
     await fs.unlink(outputPath).catch(() => {});
@@ -362,45 +289,26 @@ async function processNextInQueue(guildId: string) {
     return;
   }
 
-  const item = session.queue.shift();
-  if (!item) return;
+  const audioUrl = session.queue.shift();
+  if (!audioUrl) return;
 
   session.isPlaying = true;
-  session.currentClip = item;
   try {
     let buffer: Buffer;
-    if (item.audioUrl.startsWith("data:audio/mpeg;base64,")) {
-      const base64Data = item.audioUrl.split(",")[1];
+    if (audioUrl.startsWith("data:audio/mpeg;base64,")) {
+      const base64Data = audioUrl.split(",")[1];
       buffer = Buffer.from(base64Data, "base64");
     } else {
-      const res = await fetch(item.audioUrl);
+      const res = await fetch(audioUrl);
       if (!res.ok) throw new Error(`Falha ao obter áudio TTS: HTTP ${res.status}`);
       const arrayBuffer = await res.arrayBuffer();
       buffer = Buffer.from(arrayBuffer);
     }
     const resource = createAudioResource(Readable.from(buffer));
-    emitVoicePlaybackEvent({
-      type: "speech:start",
-      guildId,
-      clipId: item.clipId,
-      meta: item.meta,
-      timestamp: Date.now(),
-    });
     session.player.play(resource);
   } catch (err) {
     console.error("[TTS Queue Error]:", err);
-    const failed = session.currentClip;
-    session.currentClip = null;
     session.isPlaying = false;
-    if (failed) {
-      emitVoicePlaybackEvent({
-        type: "speech:end",
-        guildId,
-        clipId: failed.clipId,
-        meta: failed.meta,
-        timestamp: Date.now(),
-      });
-    }
     processNextInQueue(guildId);
   }
 }
@@ -525,20 +433,127 @@ export async function cloneAndSaveVoice(
 }
 
 export const CAPCUT_VOICES: Record<string, { id: string; name: string; desc: string }> = {
+  // --- VOZES PORTUGUESAS MASCULINAS (TIKTOK PT-BR) ---
+  narrator: {
+    id: "br_005",
+    name: "🎙️ Lucas / Narrador (PT-BR Masculino)",
+    desc: "Voz masculina brasileira clássica de narrador do TikTok",
+  },
+  tiktok_contra: {
+    id: "ICL_br_male_212M_LuizS",
+    name: "🧔 Contra / Luiz (PT-BR Masculino)",
+    desc: "Voz masculina brasileira diferente e expressiva do TikTok",
+  },
+  tiktok_bueno: {
+    id: "pt_male_bueno",
+    name: "⚽ Galvão Bueno (PT-BR Masculino)",
+    desc: "Voz masculina brasileira icônica de locutor esportivo do TikTok",
+  },
+  tiktok_bv_male: {
+    id: "BV531_streaming",
+    name: "🎧 Bruno (PT-BR Masculino)",
+    desc: "Voz masculina portuguesa alternativa do motor TikTok/ByteDance",
+  },
+
+  // --- VOZES PORTUGUESAS FEMININAS (TIKTOK PT-BR) ---
+  tiktok_laizza: {
+    id: "pt_female_laizza",
+    name: "👩 Laizza (PT-BR Feminino)",
+    desc: "Voz feminina brasileira marcante e natural do TikTok",
+  },
   lhays_anime: {
     id: "pt_female_lhays",
-    name: "Dubladora Anime BR (Lhays)",
-    desc: "Voz oficial da dubladora de animes no Brasil (CapCut/TikTok)",
+    name: "🎀 Lhays Macedo (PT-BR Feminino)",
+    desc: "Voz oficial da dubladora de animes no Brasil no TikTok",
+  },
+  tiktok_ivete: {
+    id: "bp_female_ivete",
+    name: "🎤 Ivete Sangalo (PT-BR Feminino)",
+    desc: "Voz feminina brasileira carismática e animada do TikTok",
+  },
+  tiktok_ludmilla: {
+    id: "bp_female_ludmilla",
+    name: "🎶 Ludmilla (PT-BR Feminino)",
+    desc: "Voz feminina brasileira estilizada e expressiva do TikTok",
   },
   garota_timida: {
     id: "br_003",
-    name: "🌸 Anime Girl Shy (Garota Tímida)",
-    desc: "Voz estilo Garota Tímida (Anime Girl Shy) em português com tom fofo, tímido e suave",
+    name: "🌸 Júlia / Tímida (PT-BR Feminino)",
+    desc: "Voz feminina brasileira suave do TikTok",
+  },
+  tiktok_br_f1: {
+    id: "br_001",
+    name: "✨ Camila (PT-BR Feminino 1)",
+    desc: "Voz feminina brasileira padrão 1 do TikTok",
+  },
+  tiktok_br_f3: {
+    id: "br_004",
+    name: "💎 Ana (PT-BR Feminino 3)",
+    desc: "Voz feminina brasileira padrão 3 do TikTok",
+  },
+
+  // --- VOZES EXCLUSIVAS ENGRAÇADAS EM PORTUGUÊS (DONO DA PARTIDA 👑) ---
+  tiktok_funny_male: {
+    id: "ICL_br_male_212M_LuizS",
+    name: "🤡 Zé Maluco / Esquilo (PT-BR Masculina Engraçada · Exclusiva 👑)",
+    desc: "Voz masculina engraçada acelerada em português exclusiva de quem começa o jogo",
+  },
+  tiktok_funny_male_grumpy: {
+    id: "pt_male_bueno",
+    name: "🐸 Pato / Voz Engrossada (PT-BR Masculina Engraçada · Exclusiva 👑)",
+    desc: "Voz masculina engraçada grave e trêmula em português exclusiva de quem começa o jogo",
+  },
+  tiktok_funny_female: {
+    id: "pt_female_laizza",
+    name: "🤪 Paty Esquilo / Maluca (PT-BR Feminina Engraçada · Exclusiva 👑)",
+    desc: "Voz feminina engraçada em português exclusiva de quem começa o jogo",
+  },
+  tiktok_funny_female_drama: {
+    id: "bp_female_ivete",
+    name: "🎭 Tia Dramática / Doida (PT-BR Feminina Engraçada · Exclusiva 👑)",
+    desc: "Voz feminina engraçada grave e dramática em português exclusiva de quem começa o jogo",
+  },
+
+  // --- MOTORES ESPECIAIS ---
+  google_tts: {
+    id: "google_tts",
+    name: "🤖 Voz do Google (Tradutor)",
+    desc: "A voz clássica do Google Tradutor em português do Brasil",
   },
   anytospeech_mcp: {
     id: "anytospeech_mcp",
     name: "⚡ AnyToSpeech MCP Server",
     desc: "Geração ultra-rápida via protocolo MCP (AnyToSpeech API)",
+  },
+};
+
+export const FUNNY_PT_VOICE_FILTERS: Record<
+  string,
+  { baseTikTokVoice: string; fallbackTikTokVoices: string[]; ffmpegFilter: string; label: string }
+> = {
+  tiktok_funny_male: {
+    baseTikTokVoice: "ICL_br_male_212M_LuizS",
+    fallbackTikTokVoices: ["br_005", "pt_male_bueno", "BV531_streaming"],
+    ffmpegFilter: "rubberband=pitch=1.34:tempo=1.12,vibrato=f=7:d=0.22",
+    label: "🤡 Zé Maluco / Esquilo (PT-BR Masculina Engraçada 👑)",
+  },
+  tiktok_funny_male_grumpy: {
+    baseTikTokVoice: "pt_male_bueno",
+    fallbackTikTokVoices: ["ICL_br_male_212M_LuizS", "br_005", "BV531_streaming"],
+    ffmpegFilter: "rubberband=pitch=0.72:tempo=1.06,tremolo=f=14:d=0.35",
+    label: "🐸 Pato / Voz Engrossada (PT-BR Masculina Engraçada 👑)",
+  },
+  tiktok_funny_female: {
+    baseTikTokVoice: "pt_female_laizza",
+    fallbackTikTokVoices: ["pt_female_lhays", "bp_female_ivete", "br_003"],
+    ffmpegFilter: "rubberband=pitch=1.36:tempo=1.12,vibrato=f=7.5:d=0.22",
+    label: "🤪 Paty Esquilo / Maluca (PT-BR Feminina Engraçada 👑)",
+  },
+  tiktok_funny_female_drama: {
+    baseTikTokVoice: "bp_female_ivete",
+    fallbackTikTokVoices: ["pt_female_laizza", "pt_female_lhays", "br_003"],
+    ffmpegFilter: "rubberband=pitch=0.78:tempo=0.96,chorus=0.6:0.9:45:0.3:0.25:2",
+    label: "🎭 Tia Dramática / Doida (PT-BR Feminina Engraçada 👑)",
   },
 };
 
@@ -658,12 +673,94 @@ async function fetchUrlAsBuffer(url: string): Promise<Buffer> {
   return Buffer.from(arrayBuffer);
 }
 
+function splitTextForTikTok(text: string, maxBytes = 220): string[] {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return [];
+  if (Buffer.byteLength(normalized, "utf8") <= maxBytes) {
+    return [normalized];
+  }
+
+  const chunks: string[] = [];
+  const words = normalized.split(" ");
+  let current = "";
+
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      current = candidate;
+    } else {
+      if (current) chunks.push(current);
+      if (Buffer.byteLength(word, "utf8") > maxBytes) {
+        let slice = "";
+        for (const ch of word) {
+          if (Buffer.byteLength(slice + ch, "utf8") > maxBytes) {
+            chunks.push(slice);
+            slice = ch;
+          } else {
+            slice += ch;
+          }
+        }
+        current = slice;
+      } else {
+        current = word;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function fetchTikTokTtsAudioBuffer(text: string, tiktokVoiceId: string): Promise<Buffer | null> {
+  const chunks = splitTextForTikTok(text, 220);
+  if (chunks.length === 0) return null;
+
+  const chunkBuffers: Buffer[] = [];
+  for (const chunk of chunks) {
+    let chunkBuf: Buffer | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const ttsRes = await fetch("https://tiktok-tts.weilnet.workers.dev/api/generation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: chunk,
+            voice: tiktokVoiceId,
+          }),
+          signal: AbortSignal.timeout(9000),
+        });
+        if (ttsRes.ok) {
+          const ttsData = (await ttsRes.json()) as { success?: boolean; data?: string; error?: string };
+          if (ttsData?.success && ttsData.data) {
+            chunkBuf = Buffer.from(ttsData.data, "base64");
+            break;
+          }
+        }
+      } catch (err) {
+        if (attempt === 3) {
+          console.warn(`[TikTok TTS] Falha na tentativa ${attempt} para voz ${tiktokVoiceId}:`, (err as Error).message);
+        }
+      }
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 250 * attempt));
+      }
+    }
+    if (!chunkBuf) return null;
+    chunkBuffers.push(chunkBuf);
+  }
+
+  return Buffer.concat(chunkBuffers);
+}
+
+function isRawTikTokVoiceId(voiceKey: string): boolean {
+  return /^(br_|pt_|en_|es_|fr_|de_|jp_|kr_|ICL_|BV\d)/i.test(voiceKey);
+}
+
 /**
- * Generates clean MP3 audio Buffer for any text using Cloned Voices, MCP, CapCut/TikTok PT Voices, or Google TTS fallback.
+ * Generates clean MP3 audio Buffer for any text using Cloned Voices, MCP, or TikTok Neural Voices.
  */
 export async function synthesizeSpeechAudio(
   text: string,
-  voiceKey = "lhays_anime",
+  voiceKey = "narrator",
   mcpApiKey?: string,
   expression = "neutral"
 ): Promise<{ mp3Buffer: Buffer; voiceUsed: string; expressionUsed: string }> {
@@ -673,91 +770,16 @@ export async function synthesizeSpeechAudio(
   }
 
   const clonedVoice = clonedVoicesMap.get(voiceKey);
-  const targetVoice = CAPCUT_VOICES[voiceKey] || CAPCUT_VOICES["lhays_anime"];
-  const voiceNameUsed = clonedVoice?.name || targetVoice.name;
+  const presetVoice = CAPCUT_VOICES[voiceKey];
+  const resolvedDirectId = presetVoice?.id || (isRawTikTokVoiceId(voiceKey) ? voiceKey : undefined);
+  const voiceNameUsed = clonedVoice?.name || presetVoice?.name || resolvedDirectId || CAPCUT_VOICES["narrator"].name;
   const expr = (expression || "neutral").toLowerCase();
-  console.log(`[Discord Voice] Sintetizando áudio para: "${trimmed}" (Voz: ${voiceNameUsed} | Expressão: ${expr})`);
+  console.log(`[Discord Voice] Sintetizando áudio para: "${trimmed}" (Voz: ${voiceNameUsed} | Key: ${voiceKey})`);
 
   let audioUrl: string | null = null;
 
-  // 1. If voiceKey matches a saved cloned voice, synthesize with cloned reference sample and expression
-  if (clonedVoice) {
-    console.log(`[Discord Voice] Sintetizando fala com a Voz Clonada do Usuário: "${clonedVoice.name}" (${clonedVoice.id}) [Expressão: ${expr}]...`);
-    audioUrl = await generateSpeechViaMCP(
-      trimmed,
-      clonedVoice.mcpVoiceId || clonedVoice.id,
-      mcpApiKey,
-      undefined,
-      clonedVoice.sampleBase64,
-      expr
-    );
-
-    // If MCP is unreachable for cloned voice, fallback to male/neutral TTS narrator instead of female anime voice
-    if (!audioUrl) {
-      console.log(`[Discord Voice] Utilizando voz neural masculina/narrativa para voz clonada: ${clonedVoice.name}`);
-      const maleVoices = ["br_005", "pt_male_001", "br_003"];
-      for (const mv of maleVoices) {
-        try {
-          const ttsRes = await fetch("https://tiktok-tts.weilnet.workers.dev/api/generation", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              text: trimmed,
-              voice: mv,
-            }),
-          });
-          const ttsData = await ttsRes.json();
-          if (ttsData && ttsData.success && ttsData.data) {
-            audioUrl = `data:audio/mpeg;base64,${ttsData.data}`;
-            break;
-          }
-        } catch {}
-      }
-    }
-  }
-
-  // 2. Try MCP Server generation first if selected or if API key provided
-  if (!audioUrl && (voiceKey === "anytospeech_mcp" || mcpApiKey || process.env.ANYTOSPEECH_API_KEY)) {
-    audioUrl = await generateSpeechViaMCP(trimmed, "anime-girl-shy", mcpApiKey, undefined, undefined, expr);
-  }
-
-  // 3. High Quality CapCut/TikTok PT Neural Voices for preset selection
-  if (!audioUrl) {
-    const voicesToTry = [
-      targetVoice.id,
-      "pt_female_lhays",
-      "br_004",
-      "br_003",
-      "pt_female_laizza",
-    ];
-
-    for (const v of voicesToTry) {
-      try {
-        const ttsRes = await fetch("https://tiktok-tts.weilnet.workers.dev/api/generation", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: trimmed,
-            voice: v,
-          }),
-        });
-        const ttsData = await ttsRes.json();
-        if (ttsData && ttsData.success && ttsData.data) {
-          audioUrl = `data:audio/mpeg;base64,${ttsData.data}`;
-          console.log(`[Discord Voice] ✅ Áudio neural limpo gerado com sucesso via CapCut/TikTok TTS (${v})!`);
-          break;
-        }
-      } catch (err) {
-        console.warn(`[CapCut TTS] Falha ao tentar voz ${v}:`, (err as Error).message);
-      }
-    }
-  }
-
-  let mp3Buffer: Buffer;
-  if (audioUrl) {
-    mp3Buffer = await fetchUrlAsBuffer(audioUrl);
-  } else {
-    console.warn("[Discord Voice] Fallback para Google TTS (gtts)");
+  // Explicit Google TTS ONLY when specifically requested outside TikTok game roles
+  if (voiceKey === "google_tts" || voiceKey === "google" || voiceKey === "male_google") {
     const urls = gtts.getAllAudioUrls(trimmed, {
       lang: "pt-BR",
       slow: false,
@@ -768,12 +790,104 @@ export async function synthesizeSpeechAudio(
     for (const item of urls) {
       parts.push(await fetchUrlAsBuffer(item.url));
     }
-    mp3Buffer = Buffer.concat(parts);
+    return {
+      mp3Buffer: Buffer.concat(parts),
+      voiceUsed: "Voz do Google (Tradutor)",
+      expressionUsed: expr,
+    };
   }
 
+  // 1. If voiceKey matches a saved cloned voice, synthesize with cloned reference sample and expression
+  if (clonedVoice) {
+    console.log(`[Discord Voice] Sintetizando fala com a Voz Clonada do Usuário: "${clonedVoice.name}" (${clonedVoice.id})...`);
+    audioUrl = await generateSpeechViaMCP(
+      trimmed,
+      clonedVoice.mcpVoiceId || clonedVoice.id,
+      mcpApiKey,
+      undefined,
+      clonedVoice.sampleBase64,
+      expr
+    );
+
+    if (!audioUrl) {
+      const clonedFallback = await fetchTikTokTtsAudioBuffer(trimmed, "ICL_br_male_212M_LuizS");
+      if (clonedFallback) {
+        return { mp3Buffer: clonedFallback, voiceUsed: `${clonedVoice.name} (TikTok Contra)`, expressionUsed: expr };
+      }
+    }
+  }
+
+  // 2. Use AnyToSpeech MCP ONLY when explicitly requested via anytospeech_mcp or explicit mcpApiKey
+  if (!audioUrl && (voiceKey === "anytospeech_mcp" || Boolean(mcpApiKey))) {
+    audioUrl = await generateSpeechViaMCP(trimmed, "anime-girl-shy", mcpApiKey, undefined, undefined, expr);
+  }
+
+  if (audioUrl) {
+    const mp3Buffer = await fetchUrlAsBuffer(audioUrl);
+    return { mp3Buffer, voiceUsed: voiceNameUsed, expressionUsed: expr };
+  }
+
+  // 2.5. Funny Portuguese Exclusive Voices (synthesized in PT-BR TikTok + comedic DSP filter)
+  const funnyPtConfig = FUNNY_PT_VOICE_FILTERS[voiceKey];
+  if (funnyPtConfig) {
+    const candidates = [funnyPtConfig.baseTikTokVoice, ...funnyPtConfig.fallbackTikTokVoices];
+    for (const v of candidates) {
+      const rawTikTokBuf = await fetchTikTokTtsAudioBuffer(trimmed, v);
+      if (rawTikTokBuf && rawTikTokBuf.length > 0) {
+        const funnyBuf = await applyFfmpegVoiceFilter(rawTikTokBuf, funnyPtConfig.ffmpegFilter);
+        console.log(`[Discord Voice] 🤡 Áudio engraçado PT-BR gerado (${voiceKey} -> base ${v} | ${funnyBuf.length} bytes)!`);
+        return {
+          mp3Buffer: funnyBuf,
+          voiceUsed: `${funnyPtConfig.label} [${v}]`,
+          expressionUsed: expr,
+        };
+      }
+    }
+  }
+
+  // 3. TikTok Portuguese Voices Only (chunked + retried so long Portuguese sentences never switch to English or Google)
+  const isNarratorRequest = voiceKey === "narrator" || voiceKey === "tiktok_narrator" || voiceKey === "br_005";
+  const isMaleRequest = voiceKey === "male" || voiceKey === "tiktok_male" || voiceKey === "tiktok_contra";
+  const isFemaleRequest = voiceKey === "female" || voiceKey === "tiktok_female" || voiceKey === "tiktok_laizza";
+
+  const voicesToTry = isNarratorRequest
+    ? ["br_005", "ICL_br_male_212M_LuizS", "pt_male_bueno", "BV531_streaming"]
+    : isMaleRequest
+    ? ["ICL_br_male_212M_LuizS", "pt_male_bueno", "br_005", "BV531_streaming"]
+    : isFemaleRequest
+    ? ["pt_female_laizza", "pt_female_lhays", "bp_female_ivete", "bp_female_ludmilla", "br_003", "br_001", "br_004"]
+    : resolvedDirectId && resolvedDirectId !== "google_tts" && resolvedDirectId !== "anytospeech_mcp"
+    ? [resolvedDirectId, "br_005", "ICL_br_male_212M_LuizS", "pt_male_bueno", "pt_female_laizza", "pt_female_lhays"]
+    : ["br_005", "ICL_br_male_212M_LuizS", "pt_male_bueno", "pt_female_laizza", "pt_female_lhays", "br_003"];
+
+  for (const v of voicesToTry) {
+    if (!v || v === "google_tts" || v === "anytospeech_mcp") continue;
+    const tiktokBuf = await fetchTikTokTtsAudioBuffer(trimmed, v);
+    if (tiktokBuf && tiktokBuf.length > 0) {
+      console.log(`[Discord Voice] ✅ Áudio TikTok gerado com sucesso (${v} | ${tiktokBuf.length} bytes)!`);
+      return {
+        mp3Buffer: tiktokBuf,
+        voiceUsed: `${voiceNameUsed} [${v}]`,
+        expressionUsed: expr,
+      };
+    }
+  }
+
+  // Emergency fallback only if all TikTok endpoints are unreachable
+  console.warn("[Discord Voice] ⚠️ Todos os endpoints TikTok falharam; usando fallback emergencial.");
+  const urls = gtts.getAllAudioUrls(trimmed, {
+    lang: "pt-BR",
+    slow: false,
+    host: "https://translate.google.com",
+    splitPunct: ".?!,;:\n",
+  });
+  const parts: Buffer[] = [];
+  for (const item of urls) {
+    parts.push(await fetchUrlAsBuffer(item.url));
+  }
   return {
-    mp3Buffer,
-    voiceUsed: voiceNameUsed,
+    mp3Buffer: Buffer.concat(parts),
+    voiceUsed: "Fallback Emergencial",
     expressionUsed: expr,
   };
 }
@@ -1041,8 +1155,7 @@ export async function speakInVoiceCall(
   voiceChannelId?: string,
   voiceKey = "lhays_anime",
   mcpApiKey?: string,
-  expression = "neutral",
-  meta?: VoiceSpeechMeta
+  expression = "neutral"
 ): Promise<{ success: boolean; channelName: string; text: string; voiceUsed: string; expressionUsed: string }> {
   const prevChain = speechChains.get(guildId) || Promise.resolve();
   const nextTask = prevChain
@@ -1075,17 +1188,7 @@ export async function speakInVoiceCall(
         expression
       );
 
-      const clipId = `clip_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const enrichedMeta: VoiceSpeechMeta = {
-        ...meta,
-        displayText: meta?.displayText || trimmed,
-      };
-
-      session.queue.push({
-        audioUrl: `data:audio/mpeg;base64,${mp3Buffer.toString("base64")}`,
-        clipId,
-        meta: enrichedMeta,
-      });
+      session.queue.push(`data:audio/mpeg;base64,${mp3Buffer.toString("base64")}`);
 
       if (!session.isPlaying) {
         await processNextInQueue(guildId);
@@ -1097,6 +1200,50 @@ export async function speakInVoiceCall(
         text: trimmed,
         voiceUsed,
         expressionUsed,
+      };
+    });
+
+  speechChains.set(guildId, nextTask);
+  return nextTask;
+}
+
+/**
+ * Queues pre-synthesized audio buffers into the voice call strictly sequentially with zero network delay
+ */
+export async function queuePreloadedAudioBuffersInVoiceCall(
+  guildId: string,
+  buffers: Buffer[],
+  voiceChannelId?: string
+): Promise<{ success: boolean; channelName: string }> {
+  if (buffers.length === 0) return { success: true, channelName: "" };
+
+  const prevChain = speechChains.get(guildId) || Promise.resolve();
+  const nextTask = prevChain
+    .catch(() => {})
+    .then(async () => {
+      let session = voiceSessions.get(guildId);
+      if (!session || session.connection.state.status === VoiceConnectionStatus.Destroyed) {
+        if (!voiceChannelId) {
+          throw new Error("Selecione um canal de voz para o bot entrar na call!");
+        }
+        await joinVoiceCall(guildId, voiceChannelId);
+        session = voiceSessions.get(guildId);
+      }
+      if (!session) {
+        throw new Error("Falha ao inicializar sessão de voz.");
+      }
+
+      for (const buf of buffers) {
+        session.queue.push(`data:audio/mpeg;base64,${buf.toString("base64")}`);
+      }
+
+      if (!session.isPlaying) {
+        await processNextInQueue(guildId);
+      }
+
+      return {
+        success: true,
+        channelName: session.channelName,
       };
     });
 
@@ -1168,11 +1315,7 @@ export async function playCustomMediaInVoiceCall(
 
     console.log(`[Discord Voice] Reproduzindo arquivo personalizado "${filename}" na call "${session.channelName}" (${convertedBuffer.length} bytes)`);
 
-    session.queue.push({
-      audioUrl: dataUrl,
-      clipId: `media_${Date.now()}`,
-      meta: { kind: "general", displayText: `Reproduzindo áudio: ${filename}` },
-    });
+    session.queue.push(dataUrl);
 
     if (!session.isPlaying) {
       await processNextInQueue(guildId);

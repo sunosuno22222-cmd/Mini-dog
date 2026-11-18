@@ -1117,13 +1117,14 @@ apiRouter.post("/discord/call-game/start", async (req: Request, res: Response) =
 
   try {
     const oauth = await getDiscordOAuthSessionInfo(req);
-    if (!oauth.connected || !oauth.user) {
-      return res.status(400).json({
-        error:
-          "Conexão obrigatória: conecte sua conta Discord via OAuth2 antes de iniciar o Jogo da Call.",
-        code: "OAUTH_REQUIRED",
-      });
-    }
+    const connectedAccount =
+      oauth.connected && oauth.user
+        ? {
+            userId: oauth.user.id,
+            username: oauth.user.globalName || oauth.user.username,
+            avatar: oauth.user.avatarUrl,
+          }
+        : null;
 
     const game = await startCallGame({
       guildId,
@@ -1139,11 +1140,7 @@ apiRouter.post("/discord/call-game/start", async (req: Request, res: Response) =
           ? questionsPerMatch
           : Number(questionsPerMatch) || undefined,
       roundSeconds: typeof roundSeconds === "number" ? roundSeconds : Number(roundSeconds) || undefined,
-      connectedAccount: {
-        userId: oauth.user.id,
-        username: oauth.user.globalName || oauth.user.username,
-        avatar: oauth.user.avatarUrl,
-      },
+      connectedAccount,
       autoScreenBroadcast: autoScreenBroadcast !== false,
     });
     res.json({ success: true, game });

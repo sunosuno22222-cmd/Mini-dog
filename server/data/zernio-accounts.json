@@ -1,0 +1,23 @@
+{
+  "profilesByUser": {
+    "fb_WTRCgByyzrPEqZ1DIsPgACj4hdx2": "6afdc4bbaec130239dde7fff",
+    "panel-owner": "6afcba4637657a36f5a789f7"
+  },
+  "accounts": {
+    "6afd6f25bba8f84ae2ca10db": {
+      "id": "6afd6f25bba8f84ae2ca10db",
+      "discordUserId": "panel-owner",
+      "zernioAccountId": "6afd6f25bba8f84ae2ca10db",
+      "zernioProfileId": "6afd6f12c31841578f14ab0b",
+      "platform": "tiktok",
+      "username": "5573exp",
+      "displayName": "5573exp",
+      "avatarUrl": "https://media.zernio.com/media/tiktok-avatars/1795007914058_ab62cfa76d4b411e_tiktok-avatar--000bGoI8D7iionEIl8SJVTDpfXxo0ZgOUHx.jpg",
+      "status": "connected",
+      "isDefault": true,
+      "connectedAt": "2026-11-18T15:37:51.782Z",
+      "updatedAt": "2026-11-18T15:41:00.630Z"
+    }
+  },
+  "posts": {}
+}

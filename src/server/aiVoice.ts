@@ -35,19 +35,29 @@ interface PersistedAiVoiceFile {
 const CONFIG_FILE = path.join(process.cwd(), ".ai-voice-config.json");
 export const DEFAULT_VIP_DADDY_ID = "1554257592015003674";
 
-const config: AiVoiceConfig = {
-  enabled: true,
-  prefix: "n!",
-  model: "openai/gpt-oss-120b",
-  voice: "lhays_anime",
-  expression: "shy",
-  crazyChance: 60,
-  vipDaddyId: DEFAULT_VIP_DADDY_ID,
-};
+const gAiVoice = globalThis as any;
+if (!gAiVoice.__aiVoiceState) {
+  gAiVoice.__aiVoiceState = {
+    config: {
+      enabled: true,
+      prefix: "n!",
+      model: "openai/gpt-oss-120b",
+      voice: "lhays_anime",
+      expression: "shy",
+      crazyChance: 60,
+      vipDaddyId: DEFAULT_VIP_DADDY_ID,
+    } satisfies AiVoiceConfig,
+    channelHistory: new Map<string, Array<{ role: "user" | "assistant"; content: string }>>(),
+    aiVoiceLogs: [] as AiVoiceLogEntry[],
+    processedMessageIds: new Set<string>(),
+  };
+}
 
-const channelHistory = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
-const aiVoiceLogs: AiVoiceLogEntry[] = [];
-const processedMessageIds = new Set<string>();
+const config: AiVoiceConfig = gAiVoice.__aiVoiceState.config;
+const channelHistory: Map<string, Array<{ role: "user" | "assistant"; content: string }>> =
+  gAiVoice.__aiVoiceState.channelHistory;
+const aiVoiceLogs: AiVoiceLogEntry[] = gAiVoice.__aiVoiceState.aiVoiceLogs;
+const processedMessageIds: Set<string> = gAiVoice.__aiVoiceState.processedMessageIds;
 
 export function hydrateAiVoiceFromDisk(): void {
   try {

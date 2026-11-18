@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
   Client,
   Events,
@@ -12,6 +14,8 @@ import {
   Role,
 } from "discord.js";
 import { isTestBotUser } from "./testBot";
+
+const MODERATION_DATA_FILE = path.resolve(process.cwd(), "server", "data", "moderation-config.json");
 
 export interface ModerationConfig {
   antiSpamEnabled: boolean;
@@ -38,33 +42,99 @@ export interface SecurityLogEntry {
   details: string;
 }
 
-const config: ModerationConfig = {
-  antiSpamEnabled: true,
-  newMemberMaxDays: 2,
-  timeoutDurationMinutes: 10,
-  banOnRepeatOffense: true,
-  antiRogueBotEnabled: true,
-  antiMassPingEnabled: true,
-  antiInviteLinksEnabled: true,
-  antiRaidShieldEnabled: true,
-  antiNukeEnabled: true,
-  antiRoleNukeEnabled: true,
-  antiWebhookFloodEnabled: true,
-};
+const gMod = globalThis as any;
+if (!gMod.__moderationState) {
+  gMod.__moderationState = {
+    config: {
+      antiSpamEnabled: true,
+      newMemberMaxDays: 2,
+      timeoutDurationMinutes: 10,
+      banOnRepeatOffense: true,
+      antiRogueBotEnabled: true,
+      antiMassPingEnabled: true,
+      antiInviteLinksEnabled: true,
+      antiRaidShieldEnabled: true,
+      antiNukeEnabled: true,
+      antiRoleNukeEnabled: true,
+      antiWebhookFloodEnabled: true,
+    } satisfies ModerationConfig,
+    securityLogs: [] as SecurityLogEntry[],
+    userMessageHistory: new Map<string, { content: string; timestamp: number; messageId: string }[]>(),
+    userInfractions: new Map<string, number>(),
+    recentGuildJoins: [] as number[],
+    channelDeleteTracker: new Map<string, { count: number; timestamp: number }>(),
+    activeQuarantines: new Set<string>(),
+    quarantineReleaseWaiters: new Map<string, Array<() => void>>(),
+    whitelistedBotIds: new Set<string>(),
+  };
+}
 
-const securityLogs: SecurityLogEntry[] = [];
-const userMessageHistory = new Map<string, { content: string; timestamp: number; messageId: string }[]>();
-const userInfractions = new Map<string, number>();
-const recentGuildJoins: number[] = [];
-const channelDeleteTracker = new Map<string, { count: number; timestamp: number }>();
-const activeQuarantines = new Set<string>();
-const quarantineReleaseWaiters = new Map<string, Array<() => void>>();
-const whitelistedBotIds = new Set<string>();
+const config: ModerationConfig = gMod.__moderationState.config;
+const securityLogs: SecurityLogEntry[] = gMod.__moderationState.securityLogs;
+const userMessageHistory: Map<string, { content: string; timestamp: number; messageId: string }[]> =
+  gMod.__moderationState.userMessageHistory;
+const userInfractions: Map<string, number> = gMod.__moderationState.userInfractions;
+const recentGuildJoins: number[] = gMod.__moderationState.recentGuildJoins;
+const channelDeleteTracker: Map<string, { count: number; timestamp: number }> =
+  gMod.__moderationState.channelDeleteTracker;
+const activeQuarantines: Set<string> = gMod.__moderationState.activeQuarantines;
+const quarantineReleaseWaiters: Map<string, Array<() => void>> =
+  gMod.__moderationState.quarantineReleaseWaiters;
+const whitelistedBotIds: Set<string> = gMod.__moderationState.whitelistedBotIds;
+
+function persistModerationState(): void {
+  try {
+    fs.mkdirSync(path.dirname(MODERATION_DATA_FILE), { recursive: true });
+    fs.writeFileSync(
+      MODERATION_DATA_FILE,
+      JSON.stringify(
+        {
+          config,
+          whitelistedBotIds: Array.from(whitelistedBotIds),
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+  } catch (err) {
+    console.warn("[Moderation] Falha ao salvar configurações em disco:", err);
+  }
+}
+
+function hydrateModerationState(): void {
+  try {
+    if (!fs.existsSync(MODERATION_DATA_FILE)) return;
+    const raw = fs.readFileSync(MODERATION_DATA_FILE, "utf8");
+    const parsed = JSON.parse(raw) as {
+      config?: Partial<ModerationConfig>;
+      whitelistedBotIds?: unknown;
+    };
+    if (parsed?.config && typeof parsed.config === "object") {
+      Object.assign(config, parsed.config);
+    }
+    if (Array.isArray(parsed?.whitelistedBotIds)) {
+      for (const id of parsed.whitelistedBotIds) {
+        if (typeof id === "string" && /^\d{17,22}$/.test(id.trim())) {
+          whitelistedBotIds.add(id.trim());
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Moderation] Falha ao carregar configurações salvas:", err);
+  }
+}
+
+if (!gMod.__moderationState.hydrated) {
+  hydrateModerationState();
+  gMod.__moderationState.hydrated = true;
+}
 
 export function whitelistBotId(botId?: string | null): void {
   const clean = botId?.trim();
   if (clean && /^\d{17,22}$/.test(clean)) {
     whitelistedBotIds.add(clean);
+    persistModerationState();
   }
 }
 
@@ -86,7 +156,7 @@ export async function unbanAndAuthorizeBot(
   try {
     const ban = await guild.bans.fetch(cleanId).catch(() => null);
     if (ban) {
-      await guild.bans.remove(cleanId, "2º Bot de Testes autorizado pelo Painel Phoenix");
+      await guild.bans.remove(cleanId, "2º Bot de Testes autorizado pelo Painel 573");
       unbanned = true;
     }
   } catch (err) {
@@ -144,6 +214,7 @@ export function getModerationConfig(): ModerationConfig {
 
 export function updateModerationConfig(newCfg: Partial<ModerationConfig>) {
   Object.assign(config, newCfg);
+  persistModerationState();
 }
 
 export function getSecurityLogs(): SecurityLogEntry[] {
@@ -341,7 +412,7 @@ export async function quarantineMemberSpam(
               `⏱️ **Tempo em Castigo:** ${secs} segundos cumpridos no canal **#spam-não** (**spam? Não!**)\n` +
               `🔓 **Status Atual:** Castigo removido automaticamente e todos os canais restaurados!${repeatNote}`
             )
-            .setFooter({ text: "Auto-Verificação de Segurança • Sistema Phoenix 100% Operacional" })
+            .setFooter({ text: "Auto-Verificação de Segurança • 5573 Satan 100% Operacional" })
             .setTimestamp();
 
           await targetChannel.send({ embeds: [okEmbed] }).catch(() => {});

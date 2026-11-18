@@ -1,0 +1,330 @@
+{
+  "templates": {
+    "dog": {
+      "id": "dog",
+      "categories": [
+        {
+          "name": "😈│𝐑𝐞𝐜𝐞𝐩𝐜𝐚𝐨",
+          "channels": [
+            {
+              "name": "😈│𝐞𝐧𝐭𝐫𝐚𝐝𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Boas-vindas automáticas aos novos membros do servidor."
+            },
+            {
+              "name": "💀│𝐬𝐚𝐢𝐝𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Registro automático de saída dos membros."
+            },
+            {
+              "name": "🔱│𝐫𝐞𝐠𝐫𝐚𝐬",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Leia todas as regras do servidor antes de participar."
+            },
+            {
+              "name": "🔥│𝐚𝐯𝐢𝐬𝐨𝐬",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Comunicados e atualizações importantes da administração."
+            }
+          ]
+        },
+        {
+          "name": "👿│𝐂𝐨𝐦𝐮𝐧𝐢𝐝𝐚𝐝𝐞",
+          "channels": [
+            {
+              "name": "😈│𝐜𝐡𝐚𝐭",
+              "type": "text",
+              "topic": "Bate-papo principal do servidor. Respeite os membros."
+            },
+            {
+              "name": "👿│𝐬𝐦𝐬",
+              "type": "text"
+            },
+            {
+              "name": "🖤│𝐦𝐢𝐝𝐢𝐚",
+              "type": "text",
+              "topic": "Compartilhe fotos, vídeos, memes e clipes."
+            },
+            {
+              "name": "🥀│𝐩𝐥𝐪𝐧𝐬",
+              "type": "text",
+              "topic": "Envie e divulgue suas plaquinhas."
+            },
+            {
+              "name": "⚡│𝐜𝐦𝐝𝐬",
+              "type": "text",
+              "topic": "Use os comandos do bot aqui (ex.: /beijar, /ping, /kitar)."
+            }
+          ]
+        },
+        {
+          "name": "👹│𝐌𝐮𝐫𝐚𝐥",
+          "channels": [
+            {
+              "name": "👹│𝐦𝐮𝐫𝐚𝐥-𝐝𝐚-𝐯𝐞𝐫𝐠𝐨𝐧𝐡𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Mural oficial aprovado pela administração."
+            },
+            {
+              "name": "🩸│𝐩𝐞𝐝𝐢𝐫-𝐦𝐮𝐫𝐚𝐥",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique no botão abaixo para enviar um pedido de mural aos administradores."
+            },
+            {
+              "name": "💀│𝐜𝐡𝐨𝐫𝐚𝐫",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique no botão abaixo para pedir recurso e solicitar remoção de um mural."
+            },
+            {
+              "name": "👺│𝐞𝐱𝐩",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique em EXPONHA UMA OCORRÊNCIA para enviar um relato com evidências para análise administrativa."
+            }
+          ]
+        },
+        {
+          "name": "🔥│𝐒𝐮𝐩𝐨𝐫𝐭𝐞",
+          "channels": [
+            {
+              "name": "🔥│𝐬𝐮𝐩𝐨𝐫𝐭𝐞-𝐢𝐧𝐟𝐞𝐫𝐧𝐚𝐥",
+              "type": "text",
+              "topic": "Atendimento prioritário e suporte da equipe."
+            }
+          ]
+        },
+        {
+          "name": "🦇│𝐂𝐚𝐥𝐥𝐬",
+          "channels": [
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟏", "type": "voice" },
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟐", "type": "voice" },
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟑", "type": "voice" }
+          ]
+        },
+        {
+          "name": "🩸│𝐆𝐅",
+          "channels": [
+            { "name": "🩸│𝐆𝐅 𝟏", "type": "voice", "userLimit": 2 },
+            { "name": "🩸│𝐆𝐅 𝟐", "type": "voice", "userLimit": 2 },
+            { "name": "🩸│𝐆𝐅 𝟑", "type": "voice", "userLimit": 4 }
+          ]
+        },
+        {
+          "name": "🖤│𝐌𝐮𝐬𝐢𝐜𝐚",
+          "channels": [
+            { "name": "🖤│𝐌𝐬𝐜 𝟏", "type": "voice" },
+            { "name": "🖤│𝐌𝐬𝐜 𝟐", "type": "voice" }
+          ]
+        },
+        {
+          "name": "💀│𝐀𝐅𝐊",
+          "channels": [
+            { "name": "💀│𝐀𝐅𝐊 𝟏", "type": "voice" }
+          ]
+        },
+        {
+          "name": "👺│𝐀𝐝𝐦𝐢𝐧",
+          "adminOnly": true,
+          "channels": [
+            {
+              "name": "👺│𝐬𝐭𝐟-𝐜𝐡𝐭",
+              "type": "text",
+              "topic": "Canal privado da administração."
+            },
+            {
+              "name": "🔱│𝐜𝐦𝐝𝐬-𝐚𝐝𝐦",
+              "type": "text",
+              "topic": "Canal privado para comandos administrativos (/lock, /unlock, /nuke, /excluir-mensagens, /aph)."
+            },
+            { "name": "👺│𝐜𝐚𝐥𝐥-𝐬𝐭𝐟", "type": "voice" }
+          ]
+        }
+      ]
+    },
+    "dogs1": {
+      "id": "dogs1",
+      "categories": [
+        {
+          "name": "😈│𝐑𝐞𝐜𝐞𝐩𝐜𝐚𝐨",
+          "channels": [
+            {
+              "name": "😈│𝐞𝐧𝐭𝐫𝐚𝐝𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Boas-vindas automáticas aos novos membros do servidor."
+            },
+            {
+              "name": "💀│𝐬𝐚𝐢𝐝𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Registro automático de saída dos membros."
+            },
+            {
+              "name": "🔱│𝐫𝐞𝐠𝐫𝐚𝐬",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Leia todas as regras do servidor antes de participar."
+            },
+            {
+              "name": "🔥│𝐚𝐯𝐢𝐬𝐨𝐬",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Comunicados e atualizações importantes da administração."
+            }
+          ]
+        },
+        {
+          "name": "👿│𝐂𝐨𝐦𝐮𝐧𝐢𝐝𝐚𝐝𝐞",
+          "channels": [
+            {
+              "name": "😈│𝐜𝐡𝐚𝐭",
+              "type": "text",
+              "topic": "Bate-papo principal do servidor. Respeite os membros."
+            },
+            {
+              "name": "🖤│𝐦𝐢𝐝𝐢𝐚",
+              "type": "text",
+              "topic": "Compartilhe fotos, vídeos, memes e clipes."
+            },
+            {
+              "name": "🥀│𝐩𝐥𝐪𝐧𝐬",
+              "type": "text",
+              "topic": "Envie e divulgue suas plaquinhas."
+            },
+            {
+              "name": "⚡│𝐜𝐦𝐝𝐬",
+              "type": "text",
+              "topic": "Use os comandos do bot aqui (ex.: /beijar, /ping, /kitar)."
+            }
+          ]
+        },
+        {
+          "name": "👹│𝐌𝐮𝐫𝐚𝐥",
+          "channels": [
+            {
+              "name": "👹│𝐦𝐮𝐫𝐚𝐥-𝐝𝐚-𝐯𝐞𝐫𝐠𝐨𝐧𝐡𝐚",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Mural oficial aprovado pela administração."
+            },
+            {
+              "name": "🩸│𝐩𝐞𝐝𝐢𝐫-𝐦𝐮𝐫𝐚𝐥",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique no botão abaixo para enviar um pedido de mural aos administradores."
+            },
+            {
+              "name": "💀│𝐜𝐡𝐨𝐫𝐚𝐫",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique no botão abaixo para pedir recurso e solicitar remoção de um mural."
+            }
+          ]
+        },
+        {
+          "name": "🔱│𝐒𝐞𝐫𝐯𝐢𝐜𝐨𝐬",
+          "channels": [
+            { "name": "👿│𝐬𝐦𝐬", "type": "text" },
+            {
+              "name": "👺│𝐞𝐱𝐩",
+              "type": "text",
+              "readOnly": true,
+              "topic": "Clique em EXPONHA UMA OCORRÊNCIA para enviar um relato com evidências para análise administrativa."
+            },
+            {
+              "name": "🔱│𝐩𝐝𝐫-𝐬𝐫𝐯𝐜",
+              "type": "text",
+              "topic": "Solicite serviços e atendimentos disponíveis."
+            }
+          ]
+        },
+        {
+          "name": "🦇│𝐂𝐨𝐧𝐬𝐮𝐥𝐭𝐚𝐬",
+          "channels": [
+            { "name": "🦇│𝐛𝐬𝐜-𝐢𝐩", "type": "text" },
+            { "name": "🦇│𝐛𝐬𝐜-𝐧𝐦𝐫", "type": "text" },
+            { "name": "🦇│𝐩𝐱𝐫-𝐝𝐝𝐬", "type": "text" },
+            { "name": "🦇│𝐞𝐱𝐩𝐥-𝐝𝐝𝐬", "type": "text" },
+            { "name": "🦇│𝐩𝐝𝐫-𝐝𝐝𝐬", "type": "text" }
+          ]
+        },
+        {
+          "name": "🔥│𝐒𝐮𝐩𝐨𝐫𝐭𝐞",
+          "channels": [
+            {
+              "name": "🔥│𝐩𝐞𝐝𝐢𝐫-𝐚𝐣𝐮𝐝𝐚",
+              "type": "text",
+              "topic": "Tire dúvidas com a comunidade ou equipe."
+            },
+            {
+              "name": "👺│𝐜𝐡𝐚𝐦𝐚𝐫-𝐚𝐝𝐦",
+              "type": "text",
+              "topic": "Chame um administrador quando precisar de suporte direto."
+            },
+            {
+              "name": "🔥│𝐬𝐮𝐩𝐨𝐫𝐭𝐞-𝐢𝐧𝐟𝐞𝐫𝐧𝐚𝐥",
+              "type": "text",
+              "topic": "Atendimento prioritário e suporte da equipe."
+            }
+          ]
+        },
+        {
+          "name": "🦇│𝐂𝐚𝐥𝐥𝐬",
+          "channels": [
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟏", "type": "voice" },
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟐", "type": "voice" },
+            { "name": "🦇│𝐂𝐚𝐥𝐥 𝟑", "type": "voice" }
+          ]
+        },
+        {
+          "name": "🩸│𝐆𝐅",
+          "channels": [
+            { "name": "🩸│𝐆𝐅 𝟏", "type": "voice", "userLimit": 2 },
+            { "name": "🩸│𝐆𝐅 𝟐", "type": "voice", "userLimit": 2 },
+            { "name": "🩸│𝐆𝐅 𝟑", "type": "voice", "userLimit": 4 }
+          ]
+        },
+        {
+          "name": "🖤│𝐌𝐮𝐬𝐢𝐜𝐚",
+          "channels": [
+            { "name": "🖤│𝐌𝐬𝐜 𝟏", "type": "voice" },
+            { "name": "🖤│𝐌𝐬𝐜 𝟐", "type": "voice" },
+            { "name": "🖤│𝐌𝐬𝐜 𝟑", "type": "voice" }
+          ]
+        },
+        {
+          "name": "💀│𝐀𝐅𝐊",
+          "channels": [
+            { "name": "💀│𝐀𝐅𝐊 𝟏", "type": "voice" },
+            { "name": "💀│𝐀𝐅𝐊 𝟐", "type": "voice" }
+          ]
+        },
+        {
+          "name": "👺│𝐀𝐝𝐦𝐢𝐧",
+          "adminOnly": true,
+          "channels": [
+            {
+              "name": "👺│𝐬𝐭𝐟-𝐜𝐡𝐭",
+              "type": "text",
+              "topic": "Canal privado da administração."
+            },
+            {
+              "name": "🔱│𝐜𝐦𝐝𝐬-𝐚𝐝𝐦",
+              "type": "text",
+              "topic": "Canal privado para comandos administrativos (/lock, /unlock, /nuke, /excluir-mensagens, /aph)."
+            },
+            { "name": "👺│𝐜𝐚𝐥𝐥-𝐬𝐭𝐟", "type": "voice" }
+          ]
+        }
+      ]
+    }
+  }
+}
+

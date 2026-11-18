@@ -34,10 +34,19 @@ export interface TicketData {
 }
 
 const TICKETS_FILE = path.join(process.cwd(), "tickets_data.json");
-const ticketsMap = new Map<string, TicketData>();
+const gTickets = globalThis as any;
+if (!gTickets.__ticketsState) {
+  gTickets.__ticketsState = {
+    ticketsMap: new Map<string, TicketData>(),
+    loaded: false,
+  };
+}
+const ticketsMap: Map<string, TicketData> = gTickets.__ticketsState.ticketsMap;
 
 // Load tickets from disk if present
 async function loadTicketsFromDisk() {
+  if (gTickets.__ticketsState.loaded) return;
+  gTickets.__ticketsState.loaded = true;
   try {
     const raw = await fs.readFile(TICKETS_FILE, "utf8");
     const arr: TicketData[] = JSON.parse(raw);
@@ -74,11 +83,11 @@ export const RED_DEMON_EYE_GIF = "https://i.pinimg.com/originals/aa/00/a4/aa00a4
  */
 export function buildSupportPanelMessage() {
   const embed = new EmbedBuilder()
-    .setTitle("🎫 SUPORTE")
-    .setDescription("Clique abaixo para abrir suporte.")
+    .setTitle("🎫 SUPORTE — 5573 Satan")
+    .setDescription("Central oficial de atendimento. Clique no botão abaixo para abrir um ticket privado com a moderação.")
     .setColor(0x3b82f6)
     .setImage(HACKER_MEME_GIF)
-    .setFooter({ text: "Atendimento Rápido & Privado" });
+    .setFooter({ text: "5573 Satan • Atendimento Rápido & Privado" });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -96,11 +105,11 @@ export function buildSupportPanelMessage() {
  */
 export function buildIpPanelMessage() {
   const embed = new EmbedBuilder()
-    .setTitle("👁️ OLHO DO DIABO")
-    .setDescription("Clique abaixo para abrir o ticket de busca de IP.")
+    .setTitle("👁️ OLHO DO DIABO — 5573 Satan")
+    .setDescription("Painel de inteligência e segurança. Clique abaixo para abrir uma solicitação de consulta protegida.")
     .setColor(0xef4444)
     .setImage(RED_DEMON_EYE_GIF)
-    .setFooter({ text: "Olho do Diabo" });
+    .setFooter({ text: "5573 Satan • Olho do Diabo & Segurança" });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()

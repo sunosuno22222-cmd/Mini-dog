@@ -1,0 +1,234 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated cloud-sync user profile linked to Discord manager account.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email address of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Display name of the user."
+        },
+        "discordUserId": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Linked Discord user ID."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["ownerId", "email", "displayName", "discordUserId", "createdAt", "updatedAt"]
+    },
+    "BannerRule": {
+      "title": "BannerRule",
+      "description": "Configuration for either welcome or leave dynamic image notifications.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "channelId": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "channelName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "hasImage": {
+          "type": "boolean"
+        }
+      },
+      "required": ["enabled", "channelId", "channelName", "title", "message", "hasImage"]
+    },
+    "GuildConfig": {
+      "title": "GuildConfig",
+      "description": "Persistent Discord guild welcome and leave configuration stored per user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner."
+        },
+        "guildId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 40,
+          "description": "Discord Guild ID."
+        },
+        "guildName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Discord Guild name."
+        },
+        "discordUserId": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Discord User ID that last saved this config."
+        },
+        "welcome": {
+          "type": "object",
+          "$ref": "#/entities/BannerRule"
+        },
+        "leave": {
+          "type": "object",
+          "$ref": "#/entities/BannerRule"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "guildId",
+        "guildName",
+        "discordUserId",
+        "welcome",
+        "leave",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GuildAsset": {
+      "title": "GuildAsset",
+      "description": "Compressed background image data URL for a guild welcome or leave banner.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string"
+        },
+        "guildId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 40
+        },
+        "eventType": {
+          "type": "string",
+          "enum": ["welcome", "leave"]
+        },
+        "dataUrl": {
+          "type": "string",
+          "maxLength": 900000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "guildId", "eventType", "dataUrl", "createdAt", "updatedAt"]
+    },
+    "TikTokIntegration": {
+      "title": "TikTokIntegration",
+      "description": "Encrypted TikTok OAuth2 connection state and display metadata synced for a Discord manager.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string" },
+        "provider": { "type": "string", "enum": ["tiktok"] },
+        "username": { "type": "string", "maxLength": 80 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "encryptedBackup": { "type": "string", "maxLength": 16000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "provider", "username", "displayName", "encryptedBackup", "createdAt", "updatedAt"]
+    },
+    "ExpRecord": {
+      "title": "ExpRecord",
+      "description": "Persistent history entry for an approved/pending EXP case and monotonic numbering guard.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string" },
+        "expId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 40 },
+        "guildId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 40 },
+        "guildName": { "type": "string", "maxLength": 120 },
+        "expNumber": { "type": "number" },
+        "expCode": { "type": "string", "maxLength": 32 },
+        "format": { "type": "string", "enum": ["carousel", "video"] },
+        "status": { "type": "string", "maxLength": 48 },
+        "involvedName": { "type": "string", "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 240 },
+        "whatHappened": { "type": "string", "maxLength": 1200 },
+        "whyWrong": { "type": "string", "maxLength": 800 },
+        "tiktokPublishId": { "type": "string", "maxLength": 128 },
+        "tiktokStatusText": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId",
+        "expId",
+        "guildId",
+        "guildName",
+        "expNumber",
+        "expCode",
+        "format",
+        "status",
+        "involvedName",
+        "description",
+        "whatHappened",
+        "whyWrong",
+        "tiktokPublishId",
+        "tiktokStatusText",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile for cloud synchronization."
+    },
+    "/users/{userId}/guildConfigs/{guildId}": {
+      "schema": { "$ref": "#/entities/GuildConfig" },
+      "description": "Persistent welcome and leave configurations for each Discord server managed by the user."
+    },
+    "/users/{userId}/guildConfigs/{guildId}/assets/{assetId}": {
+      "schema": { "$ref": "#/entities/GuildAsset" },
+      "description": "Compressed background banner image asset ('welcome' or 'leave') for a configured Discord server."
+    },
+    "/users/{userId}/integrations/{integrationId}": {
+      "schema": { "$ref": "#/entities/TikTokIntegration" },
+      "description": "Encrypted TikTok OAuth2 backup for the user's connected TikTok account."
+    },
+    "/users/{userId}/expRecords/{expId}": {
+      "schema": { "$ref": "#/entities/ExpRecord" },
+      "description": "Persistent EXP history records and monotonic Exp XXX numbers."
+    }
+  }
+}
